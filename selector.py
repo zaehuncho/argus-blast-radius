@@ -617,8 +617,10 @@ def lambda_body_at(stmt, lineno):
     return None
 
 
-def analyse_python(path, old_text, hunks, cov):
-    """Returns (set of tests, reason). None means 'select everything'."""
+def analyse_python(path, old_text, hunks, cov, checks=None):
+    """Returns (set of tests, reason). None means 'select everything'. A narrowing that
+    holds only if the patched module still imports appends `path` to `checks`
+    (without `checks` such a narrowing is not used)."""
     new_text, changed = apply_hunks(old_text, hunks)
     try:
         old_tree = ast.parse(old_text)
@@ -678,6 +680,11 @@ def analyse_python(path, old_text, hunks, cov):
                 narrowed = classmap.narrow(CM, cov, path, old_text, new_text, old_tree, new_tree)
             except Exception as e:  # the broad rule stands
                 log("classmap error", path, repr(e))
+        if narrowed is not None and narrowed[2]:
+            if checks is None:
+                narrowed = None
+            else:
+                checks.append(path)
         if narrowed is not None:
             return tests | narrowed[0], "class map: " + narrowed[1]
         tests |= cov.tests_touching_file(path)
@@ -786,7 +793,7 @@ NO_TEST_FILES = {"README.md", "CHANGELOG.md", "CONTRIBUTING.md", "AGENTS.md", "C
                  "MANIFEST.in", "Makefile"}
 
 
-def select(text, every, cov, tests_by_file, nodeid_num, reasons):
+def select(text, every, cov, tests_by_file, nodeid_num, reasons, checks=None):
     selected = set()
     readers_of_typing = set(tests_by_file.get("tests/test_typing.py", []))
     sqlglotc_tests = set(tests_by_file.get("tests/test_sqlglotc.py", []))
@@ -814,7 +821,7 @@ def select(text, every, cov, tests_by_file, nodeid_num, reasons):
             continue
         if path.startswith("sqlglot/") and path.endswith(".py"):
             old_text = open(full, encoding="utf-8").read()
-            got, why = analyse_python(path, old_text, f["hunks"], cov)
+            got, why = analyse_python(path, old_text, f["hunks"], cov, checks)
             if got is None:
                 reasons.append(f"{path}: {why} -> all")
                 return set(every)
@@ -928,6 +935,39 @@ def confirm_by_running(plans, dur, tfile, tid, nodeid_num, every):
                 pass
 
 
+IMPORT_CODE = "import importlib, sys\nfor m in sys.argv[1:]:\n    importlib.import_module(m)\n"
+
+
+def import_checks(plans, every):
+    """Class-map narrowings that hold only if the patched modules still import: import
+    them on the patched tree; anything but a clean import selects every test."""
+    pending = [p for p in plans if p.get("imports")]
+    if not pending:
+        return
+    runner = None
+    if not os.environ.get("ARGUS_NO_RUNNER"):
+        try:
+            import runner
+        except Exception as e:
+            log("runner unavailable for import checks:", repr(e))
+    for p in pending:
+        mods = sorted({classmap.module_of(path) for path in p["imports"]})
+        res = None
+        if runner is not None:
+            try:
+                files = runner.files_from_patch(p["text"])
+                res = runner.run_script(files, ["-c", IMPORT_CODE, *mods], timeout_s=20.0)
+            except Exception as e:
+                log(p["cid"], "import check error", repr(e))
+        if res is not None and res.get("status") == "ok" and res.get("exitcode") == 0:
+            p["reasons"].append(f"import check ok in {res['cpu_s']:.2f}s cpu")
+        else:
+            p["selected"] = set(every)
+            p["tpcds_check"] = False
+            p["reasons"].append("import check " + (f"{res.get('status')} exit={res.get('exitcode')}" if res else "not run")
+                                + " -> all")
+
+
 def tpcds_checks(plans, dur, runner, budget, start):
     """Runs tpcds_check.py for the commits where it applies and pays off; drops
     test_execute_tpcds where every optimized tree comes out as on the pinned commit."""
@@ -1019,23 +1059,33 @@ def main():
         reasons = []
         text = ""
         check = False
+        imports = []
         try:
             text = open(os.path.join(cdir, name), encoding="utf-8", errors="replace").read()
             seen = LineLog(cov, tp)
-            selected = select(text, every, seen, tests_by_file, nodeid_num, reasons) & every
+            selected = select(text, every, seen, tests_by_file, nodeid_num, reasons, imports) & every
         except Exception as e:  # never crash: a crash rejects the run; a mismatch must not miss
             selected = set(every)
+            imports = []
             reasons.append(f"{type(e).__name__} {e} -> all")
         if tp is not None and tp in selected and selected != every:
             try:
                 # narrowable only when line coverage alone selected it
-                again = select(text, every, LineLog(cov, tp, drop=True), tests_by_file, nodeid_num, []) & every
+                again = select(text, every, LineLog(cov, tp, drop=True), tests_by_file, nodeid_num, [], []) & every
                 check = tp not in again and TP.clear(seen.queries, seen.fixture)
             except Exception as e:
                 log(cid, "tpcds check planning error", repr(e))
             reasons.append(f"tpcds: {'checkable' if check else 'not checkable'}")
         plans.append({"cid": cid, "text": text, "selected": selected, "reasons": reasons,
-                      "tpcds_test": tp, "tpcds_check": check})
+                      "tpcds_test": tp, "tpcds_check": check, "imports": imports})
+    try:
+        import_checks(plans, every)
+    except Exception as e:  # unproven narrowings must not stand
+        log("import checks failed:", repr(e))
+        for p in plans:
+            if p.get("imports") and not any(r.startswith("import check ok") for r in p["reasons"]):
+                p["selected"] = set(every)
+                p["tpcds_check"] = False
     try:
         confirm_by_running(plans, dur, tfile, tid, nodeid_num, every)
     except Exception as e:  # the static selections stand

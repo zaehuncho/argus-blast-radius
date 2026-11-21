@@ -41,7 +41,8 @@ from collections import namedtuple
 
 # extra = [(path, lo, hi, limit)]: add the tests whose coverage runs any of those lines of
 # `path`, intersected with `limit` when it is a set. narrow() applies it.
-Verdict = namedtuple("Verdict", "tests reason func_ranges extra", defaults=((),))
+# import_check: True when the tests are right only if the patched module still imports.
+Verdict = namedtuple("Verdict", "tests reason func_ranges extra import_check", defaults=((), False))
 
 # Facts about the creation hooks at the pinned commit, on top of the map's own table:
 # hook -> attribute -> the attributes of the class being created that are computed from it.
@@ -71,6 +72,39 @@ FREE_LOOKUPS = [
 ]
 # the same, inside a one-line lambda: the tests that called the lambda
 FREE_LOOKUP_LAMBDAS = [("sqlglot/executor/env.py", 283, "getattr(e, this)")]
+
+# A class attribute whose new value calls exactly the same functions as the old one
+# (same callee expressions, same number of calls; no lambda or def text in between) is
+# accepted when the caller proves the patched module still imports (Verdict.import_check):
+# e.g. `CENTIMILLIS = Literal.number(5)` -> 6, or a comprehension filter `k not in (...)`
+# -> `k in (...)`. Only the value differs then; who consumed it at class creation is
+# still checked below (`strict` is required for that).
+IMPORT_CHECK_RULE = True
+
+# A class-body assignment TARGET = f(NAME) that reuses an edited attribute NAME (e.g.
+# `SHOW_TRIE = new_trie(key.split(" ") for key in SHOW_PARSERS)`): TARGET may change
+# too, so the readers of TARGET count as well (and TARGET's own reuses, recursively);
+# requires the import check, since computing TARGET from the new value could raise.
+DERIVED_RULE = True
+
+
+def _callees(n):
+    return sorted(_dump(x.func) for x in ast.walk(n) if isinstance(x, ast.Call))
+
+
+def _same_callees(a, b):
+    """Building the new value calls the same functions as the old one did: the same
+    callee expressions, as many times; lambdas (whose bodies do not run while the
+    value is built) must be identical on both sides; no walrus or yield."""
+    if any(isinstance(x, (ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom))
+           for v in (a, b) for x in ast.walk(v)):
+        return False
+
+    def lambdas(n):
+        return sorted(_dump(x) for x in ast.walk(n) if isinstance(x, ast.Lambda))
+
+    return lambdas(a) == lambdas(b) and _callees(a) == _callees(b)
+
 
 # Attributes whose edit changes state outside the classes involved:
 # _Dialect.__new__ pops entries from the generator's TRANSFORMS dict based on it.
@@ -232,13 +266,22 @@ def _reuse_sites(cls_node, name):
             if not all(any(u is d for d in defaults) for u in uses):
                 return None
             out.append(("default", s))
+        elif (
+            DERIVED_RULE
+            and _key(s) is not None
+            and _key(s)[0] == "attr"
+            and _key(s)[1] != name
+            and _same_callees(_value(s), _value(s))  # no lambda, walrus or yield in it
+        ):
+            # TARGET = f(NAME): TARGET is recomputed from the new value at class creation
+            out.append(("derived", _key(s)[1]))
         else:
             return None
     return out
 
 
 def _reuse_signature(sites):
-    return [(k, v if k == "pop" else _def_header(v)) for k, v in sites]
+    return [(k, v if k in ("pop", "derived") else _def_header(v)) for k, v in sites]
 
 
 class _Sources:
@@ -721,6 +764,27 @@ class ClassMap:
             self._extra.append((path, lo, hi, readers))
         return got
 
+    def _derive(self, cname, ca, cb, target, tests, seen):
+        """Class attribute `target` is computed in the class body from an edited one, so
+        it may differ too: its readers count, and so do attributes computed from it."""
+        if ("derived", cname, target) in seen:
+            return
+        seen.add(("derived", cname, target))
+        c = self.cls.get(cname)
+        if target.startswith("__") or target in FORCE_BROAD or target not in c["names"]:
+            raise Broad(f"{cname}.{target}: derived attribute not tracked")
+        if self._hooks_reading(cname, target) or self._edges(cname, target):
+            raise Broad(f"{cname}.{target}: derived and read while classes are created")
+        tests |= self._readers(cname, target)
+        if self._T.mentions(ca, cb, target):
+            ra, rb = _reuse_sites(ca, target), _reuse_sites(cb, target)
+            if ra is None or rb is None or _reuse_signature(ra) != _reuse_signature(rb):
+                raise Broad(f"{cname}.{target}: derived attribute used again inside the class body")
+            for kd, t2 in ra:
+                if kd != "derived":
+                    raise Broad(f"{cname}.{target}: derived attribute used again inside the class body")
+                self._derive(cname, ca, cb, t2, tests, seen)
+
     def _defined_above(self, cname, attr):
         """True if lookups of `attr` that pass this class are answered by a tracked
         attribute of the nearest base that has one (so they are all on record)."""
@@ -768,6 +832,10 @@ class ClassMap:
                 default_defs = [d for kd, d in ra if kd == "default"]
                 if default_defs and not DEFAULT_ARG_RULE:
                     raise Broad(f"{cname}.{name}: used again inside the class body")
+                for kd, target in ra:
+                    if kd == "derived":
+                        self._import_check = True
+                        self._derive(cname, ca, cb, target, tests, seen)
         strict = False
         if kind == "attr":
             if sa is not None and sb is not None:
@@ -775,9 +843,13 @@ class ClassMap:
                     isinstance(sa, ast.AnnAssign) and _dump(sa.annotation) != _dump(sb.annotation)
                 ):
                     raise Broad(f"{cname}.{name}: annotation changed")
-                if not _safe(_value(sa), _value(sb), P):
-                    raise Broad(f"{cname}.{name}: new value may fail or act at import")
                 strict = _strict(_value(sa), _value(sb))
+                if not _safe(_value(sa), _value(sb), P):
+                    if not (IMPORT_CHECK_RULE and _same_callees(_value(sa), _value(sb))):
+                        raise Broad(f"{cname}.{name}: new value may fail or act at import")
+                    # The same functions are called while the value is built: the caller
+                    # must prove the module still imports (the value is then just another object).
+                    self._import_check = True
             elif sb is not None:
                 if isinstance(sb, ast.AnnAssign) or not _inert(_value(sb), P):
                     raise Broad(f"{cname}.{name}: added value may fail or act at import")
@@ -930,6 +1002,7 @@ class ClassMap:
         except SyntaxError:
             return Verdict(None, "does not parse", [])
         funcs = []
+        self._import_check = False
         try:
             edits, funcs, lams, P = self.diff(path, old_text, new_text, old, new, funcs)
             tests, seen, why = set(), set(), []
@@ -950,7 +1023,9 @@ class ClassMap:
         if lams:
             parts.append("lambdas at " + ",".join(str(l.lineno) for l in lams))
         reason = "; ".join(parts) or "function bodies only"
-        return Verdict(tests, reason, funcs, tuple(self._extra))
+        if self._import_check:
+            reason += " (if it imports)"
+        return Verdict(tests, reason, funcs, tuple(self._extra), self._import_check)
 
 
 def narrow(cm, cov, path, old_text, new_text, old_tree=None, new_tree=None):
@@ -968,4 +1043,4 @@ def narrow(cm, cov, path, old_text, new_text, old_tree=None, new_tree=None):
     for p, lo, hi, limit in v.extra:
         got = cov.tests_covering(p, range(lo, hi + 1))
         tests |= got if limit is None else got & limit
-    return tests, v.reason
+    return tests, v.reason, v.import_check
