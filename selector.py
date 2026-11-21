@@ -212,13 +212,24 @@ class _NoneCompare(ast.NodeTransformer):
     behave the same. Comparing normalized trees treats that swap as no change.
     """
 
+    @staticmethod
+    def _identity_only(x):
+        # None, or an expression class (`exp.Foo`): classes compare by identity
+        # unless their metaclass defines __eq__, and sqlglot's only one (_Dialect)
+        # returns False for anything that is not a dialect or a string.
+        if isinstance(x, ast.Constant) and x.value is None:
+            return True
+        return (isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "exp"
+                and x.attr[:1].isupper() and not x.attr.isupper()
+                and x.attr not in ("ExpOrStr", "IntoType"))  # typing aliases, not classes
+
     def visit_Compare(self, node):
         self.generic_visit(node)
         operands = [node.left] + node.comparators
         ops = []
         for i, op in enumerate(node.ops):
             a, b = operands[i], operands[i + 1]
-            none = any(isinstance(x, ast.Constant) and x.value is None for x in (a, b))
+            none = any(self._identity_only(x) for x in (a, b))
             if none and isinstance(op, ast.Eq):
                 op = ast.Is()
             elif none and isinstance(op, ast.NotEq):
