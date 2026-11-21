@@ -1,4 +1,5 @@
-"""Commits whose selection relies on the class map's import-check rule: selection size,
+"""Commits whose selection relies on the class map's import-check rule or the module
+constant rule: selection size,
 cost, and whether every failing test is selected (local validation only).
 Usage (WSL): python3 tools/import_rule_eval.py SET_DIR [SET_DIR...]
   (answers from SET_DIR/answers.json, or RES_DIR given as SET_DIR=RES_DIR with harness results)
@@ -40,7 +41,7 @@ for arg in sys.argv[1:]:
         text = open(os.path.join(setdir, "commits", name), encoding="utf-8").read()
         reasons, checks = [], []
         sel = selector.select(text, every, cov, tests_by_file, nodeid_num, reasons, checks) & every
-        if not checks:
+        if not checks and not any("module constants" in r for r in reasons):
             continue
         total += 1
         miss = ans[cid] - sel

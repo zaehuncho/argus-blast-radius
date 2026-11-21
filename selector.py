@@ -617,6 +617,156 @@ def lambda_body_at(stmt, lineno):
     return None
 
 
+# ---------------------------------------------------------------- module constants
+#
+# A top-level `NAME = value` edit changes what NAME is bound to. When every mention of
+# NAME anywhere in sqlglot/ and tests/ sits inside a function or lambda body (it is
+# looked up when that code runs, never while modules or classes are being built), the
+# tests are those whose coverage runs one of those statements. A mention evaluated at
+# import (a module-level statement, a class body, a default, a decorator) keeps the
+# broad rule. Values that are not inert must call the same functions as before, and the
+# module must still import (checked in the container).
+
+_SOURCES = None
+_TREES = {}
+
+
+def _sources():
+    global _SOURCES
+    if _SOURCES is None:
+        _SOURCES = {}
+        for top in ("sqlglot", "tests"):
+            for dirpath, dirnames, filenames in os.walk(os.path.join(SRC, top)):
+                dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+                for fn in filenames:
+                    if fn.endswith(".py"):
+                        full = os.path.join(dirpath, fn)
+                        rel = os.path.relpath(full, SRC).replace(os.sep, "/")
+                        with open(full, encoding="utf-8") as fh:
+                            _SOURCES[rel] = fh.read()
+    return _SOURCES
+
+
+def _tree(rel):
+    if rel not in _TREES:
+        _TREES[rel] = ast.parse(_sources()[rel])
+    return _TREES[rel]
+
+
+def _mention_sites(name, defining_path, defining_stmt_lines):
+    """[(path, first line, last line)] of the statements inside function bodies that
+    mention `name` (as a name, attribute or string), and [(path, line)] of the lambdas
+    built at import whose bodies mention it; None if any mention is evaluated at import
+    time, a docstring mentions it (doctests), or it is imported under another name."""
+    word = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])")
+    sites, lams = [], []
+    for rel, text in _sources().items():
+        if name not in text or not word.search(text):
+            continue
+        tree = _tree(rel)
+
+        def visit(node, stmt, in_body, in_all, lam=None):
+            hit = False
+            if isinstance(node, ast.Name) and node.id == name:
+                hit = not isinstance(node.ctx, ast.Store) or in_body
+            elif isinstance(node, ast.Attribute) and node.attr == name:
+                hit = True
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and word.search(node.value):
+                if not in_all:
+                    if not in_body or node.value != name:
+                        return False  # docstrings and other text: doctests could read it
+                    hit = True
+            elif isinstance(node, ast.alias) and (node.name == name or node.name.endswith("." + name)):
+                if node.asname and node.asname != name:
+                    return False  # uses under the other name are not found by this search
+                if in_body:
+                    hit = True
+                # a top-level `from m import NAME` only binds it; its uses are found as names
+            if hit:
+                if not in_body:
+                    if rel == defining_path and stmt is not None and stmt.lineno in defining_stmt_lines:
+                        pass  # the defining statement itself
+                    else:
+                        return False
+                elif lam is not None:
+                    lams.append((rel, lam.lineno))  # a lambda built at import: who called it
+                else:
+                    sites.append((rel, stmt.lineno, stmt.end_lineno))
+            for field, value in ast.iter_fields(node):
+                children = value if isinstance(value, list) else [value]
+                for child in children:
+                    if not isinstance(child, ast.AST):
+                        continue
+                    child_stmt = child if isinstance(child, ast.stmt) else stmt
+                    child_body, child_lam = in_body, lam
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and field == "body":
+                        child_body, child_lam = True, None
+                    elif isinstance(node, ast.Lambda) and field == "body":
+                        if not in_body:
+                            child_lam = node
+                        child_body = True
+                    child_all = in_all or (
+                        isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)) and not in_body
+                        and any(isinstance(t, ast.Name) and t.id == "__all__"
+                                for t in (node.targets if isinstance(node, ast.Assign) else [node.target]))
+                    )
+                    if visit(child, child_stmt, child_body, child_all, child_lam) is False:
+                        return False
+            return None
+
+        if visit(tree, None, False, False) is False:
+            return None
+    return sites, lams
+
+
+def module_constants(path, old_tree, new_tree, cov):
+    """(tests, needs import check, names) for a file whose top-level changes are all
+    `NAME = value` edits the rule above can bound (def bodies are left to line
+    coverage); None otherwise."""
+    if CM is None or len(old_tree.body) != len(new_tree.body):
+        return None
+    proven = classmap._Proven(old_tree)
+    names, needs_import, lines = set(), False, {}
+    for a, b in zip(old_tree.body, new_tree.body):
+        if ast.dump(a) == ast.dump(b):
+            continue
+        if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)) and type(a) is type(b):
+            if classmap._def_header(a) == classmap._def_header(b):
+                continue  # body edits: line coverage
+            return None
+        if not (isinstance(a, (ast.Assign, ast.AnnAssign)) and type(a) is type(b)):
+            return None
+        ta = a.targets if isinstance(a, ast.Assign) else [a.target]
+        tb = b.targets if isinstance(b, ast.Assign) else [b.target]
+        if len(ta) != 1 or len(tb) != 1 or not isinstance(ta[0], ast.Name) or ast.dump(ta[0]) != ast.dump(tb[0]):
+            return None
+        if isinstance(a, ast.AnnAssign) and (a.value is None or b.value is None
+                                             or ast.dump(a.annotation) != ast.dump(b.annotation)):
+            return None
+        name = ta[0].id
+        if name.startswith("__") or name in names:
+            return None
+        if not classmap._safe(a.value, b.value, proven):
+            if not classmap._same_callees(a.value, b.value):
+                return None
+            needs_import = True
+        names.add(name)
+        lines.setdefault(name, set()).update(range(a.lineno, a.end_lineno + 1))
+    if not names:
+        return None
+    tests = set()
+    for name in names:
+        found = _mention_sites(name, path, lines[name])
+        if found is None:
+            return None
+        sites, lams = found
+        for rel, lo, hi in sites:
+            tests |= cov.tests_covering(rel, range(lo, hi + 1))
+        for rel, line in lams:
+            tests |= CM.entered(rel, line)
+    return tests, needs_import, names
+
+
 def analyse_python(path, old_text, hunks, cov, checks=None):
     """Returns (set of tests, reason). None means 'select everything'. A narrowing that
     holds only if the patched module still imports appends `path` to `checks`
@@ -674,6 +824,18 @@ def analyse_python(path, old_text, hunks, cov, checks=None):
         hi = header_end(stmt) if l <= header_end(stmt) else stmt.end_lineno
         tests |= cov.tests_covering(path, range(lo, hi + 1))
     if module_level:
+        mc = None
+        try:
+            mc = module_constants(path, old_tree, new_tree, cov)
+        except Exception as e:  # the broad rule stands
+            log("module constant rule error", path, repr(e))
+        if mc is not None and mc[1]:
+            if checks is None:
+                mc = None
+            else:
+                checks.append(path)
+        if mc is not None:
+            return tests | mc[0], "module constants " + ",".join(sorted(mc[2])) + (" (if it imports)" if mc[1] else "")
         narrowed = None
         if CM is not None:
             try:
