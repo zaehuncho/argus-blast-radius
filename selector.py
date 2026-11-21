@@ -373,9 +373,18 @@ def pack(selected, dur):
     return best[1]
 
 
+# Repository files no test reads (checked: only tests/test_sqlglotc.py reads
+# anything outside sqlglot/ and tests/, namely sqlglotc/ and the build config).
+NO_TEST_PREFIXES = (".github/", "docs/", "pdoc/", "posts/", "benchmarks/", "sqlglot-integration-tests/")
+NO_TEST_FILES = {"README.md", "CHANGELOG.md", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md", "LICENSE",
+                 ".gitignore", ".gitmodules", ".gitpod.yml", ".pre-commit-config.yaml", "sqlglot.png",
+                 "MANIFEST.in", "Makefile"}
+
+
 def select(text, every, cov, tests_by_file, nodeid_num, reasons):
     selected = set()
     readers_of_typing = set(tests_by_file.get("tests/test_typing.py", []))
+    sqlglotc_tests = set(tests_by_file.get("tests/test_sqlglotc.py", []))
     for f in parse_patch(text):
         path = f["old"] or f["new"]
         if f["old"] is None or f["new"] is None or f["old"] != f["new"]:
@@ -403,6 +412,11 @@ def select(text, every, cov, tests_by_file, nodeid_num, reasons):
             got = cov.tests_opening(path)
             selected |= got
             reasons.append(f"{path}: data file -> {len(got)}")
+        elif path in NO_TEST_FILES or path.startswith(NO_TEST_PREFIXES):
+            reasons.append(f"{path}: not read by any test -> 0")
+        elif path.startswith("sqlglotc/") or path == "setup.py":
+            selected |= sqlglotc_tests
+            reasons.append(f"{path}: build script -> test_sqlglotc")
         else:
             reasons.append(f"{path}: unknown kind -> all")
             return set(every)
