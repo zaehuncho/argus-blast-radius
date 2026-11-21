@@ -393,6 +393,47 @@ def stdlib_imports_only(old_tree, new_tree, old_text, new_text):
     return True
 
 
+def _inert(node):
+    """An expression that cannot run code or raise when evaluated at def time."""
+    if node is None or isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Not)):
+        return _inert(node.operand)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_inert(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(_inert(k) and _inert(v) for k, v in zip(node.keys, node.values))
+    return False
+
+
+def signature_defaults_only(old_def, new_tree, old_tree):
+    """The def differs only in default values (inert on both sides) or in
+    annotations. Defaults are evaluated once at def time and used only by calls
+    that omit the argument, and those calls run the function body."""
+    if not isinstance(old_def, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    path = _qualpath(old_tree, old_def)
+    new_def = _find_def(new_tree, path) if path else None
+    if new_def is None or type(new_def) is not type(old_def):
+        return False
+    oa, na = old_def.args, new_def.args
+    names = lambda a: [x.arg for x in a.posonlyargs + a.args + a.kwonlyargs]  # noqa: E731
+    if (names(oa) != names(na) or len(oa.defaults) != len(na.defaults) or len(oa.kw_defaults) != len(na.kw_defaults)
+            or bool(oa.vararg) != bool(na.vararg) or bool(oa.kwarg) != bool(na.kwarg)):
+        return False
+    for o, n in zip(oa.defaults + oa.kw_defaults, na.defaults + na.kw_defaults):
+        same = (ast.dump(o) if o is not None else None) == (ast.dump(n) if n is not None else None)
+        if not same and not (_inert(o) and _inert(n)):
+            return False
+    saved = (old_def.args, new_def.args, old_def.returns, new_def.returns)
+    try:
+        old_def.args = new_def.args = None
+        old_def.returns = new_def.returns = None
+        return ast.dump(old_def, include_attributes=False) == ast.dump(new_def, include_attributes=False)
+    finally:
+        old_def.args, new_def.args, old_def.returns, new_def.returns = saved
+
+
 _DESCRIPTORS = {"classmethod", "staticmethod", "property"}
 
 
@@ -525,6 +566,10 @@ def analyse_python(path, old_text, hunks, cov):
                 # a decorator line: classmethod/staticmethod/property changes only
                 # matter where the function is called or the property read, which
                 # runs its body (the def and decorator lines run at class creation)
+                tests |= cov.tests_covering(path, range(first_line(stmt.body[0]), stmt.end_lineno + 1))
+                continue
+            if l >= stmt.lineno and signature_defaults_only(stmt, new_tree, old_tree):
+                # a default value or annotation: only calls that run the body see it
                 tests |= cov.tests_covering(path, range(first_line(stmt.body[0]), stmt.end_lineno + 1))
                 continue
             if in_func:
