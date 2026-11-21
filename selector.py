@@ -219,14 +219,19 @@ TPCDS_RUN_FIXED_S, TPCDS_RUN_PAIR_S = 1.6, 1.0   # narrowed run CPU (measured 1.
 TPCDS_P_PASS_FEW = 0.75   # validation: 15 of 19 cases with 1-6 differing queries passed
 
 
+# The fixture holding the queries: test_execute_tpcds uses each pair's input SQL and
+# "execute" flag only, which the check re-reads from the patched file.
+TPCDS_FIXTURE = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+
+
 class TpcdsBlock:
     def __init__(self, path):
         with open(path, encoding="utf-8") as fh:
             self.lines = {f: set(v) for f, v in json.load(fh)["lines"].items()}
 
-    def clear(self, queries):
+    def clear(self, queries, fixture=False):
         """True when no queried line runs outside the parse/optimize step."""
-        if not queries:
+        if not queries and not fixture:
             return False
         for path, linenos in queries:
             block = self.lines.get(path, ())
@@ -251,6 +256,7 @@ class LineLog:
     def __init__(self, cov, test, drop=False):
         self._cov, self._test, self._drop = cov, test, drop
         self.queries = []
+        self.fixture = False
 
     def tests_covering(self, path, linenos):
         linenos = list(linenos)
@@ -259,6 +265,14 @@ class LineLog:
             if self._drop:
                 return res - {self._test}
             self.queries.append((path, linenos))
+        return res
+
+    def tests_opening(self, path):
+        res = self._cov.tests_opening(path)
+        if self._test in res and path == TPCDS_FIXTURE:
+            if self._drop:
+                return res - {self._test}
+            self.fixture = True
         return res
 
     def __getattr__(self, name):
@@ -1014,7 +1028,7 @@ def main():
             try:
                 # narrowable only when line coverage alone selected it
                 again = select(text, every, LineLog(cov, tp, drop=True), tests_by_file, nodeid_num, []) & every
-                check = tp not in again and TP.clear(seen.queries)
+                check = tp not in again and TP.clear(seen.queries, seen.fixture)
             except Exception as e:
                 log(cid, "tpcds check planning error", repr(e))
             reasons.append(f"tpcds: {'checkable' if check else 'not checkable'}")

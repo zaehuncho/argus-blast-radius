@@ -14,8 +14,11 @@ import runner  # noqa: E402
 NODE = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 d, k = sys.argv[1], sys.argv[2]
 for item in sys.argv[3:]:
-    cid, truth = item.split(":")
+    cid, truth = item.split(":")  # truth "?" = run the full test for it
     files = runner.files_from_patch(open(os.path.join(d, cid + ".patch"), encoding="utf-8").read())
+    if truth == "?":
+        full = runner.run_candidates(files, [NODE], timeout_s=600, pool_workers=2)
+        truth = "fail" if NODE in full["known_failing"] else "pass" if NODE in full["passed"] else full["status"]
     chk = runner.run_script(files, ["/app/tpcds_check.py", "--check", "/app/map/tpcds_prints.json", k], timeout_s=60)
     m = re.search(r"TPCDS_DIFFER ([0-9,]+)", chk["log_tail"])
     verdict, run_cpu = ("drop" if chk["exitcode"] == 0 else "keep"), 0.0
