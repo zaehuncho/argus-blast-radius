@@ -10,7 +10,7 @@ Builders Buildathon 2026, RWX track. Given a patch to [sqlglot](https://github.c
 | --- | --- |
 | Python source whose code tree is unchanged (comments, blank lines) | none |
 | A statement inside a function, method or lambda body | the tests whose recorded coverage executes that statement |
-| A top-level `NAME = value` whose every mention (in `sqlglot/` and `tests/`) is inside a function body | the tests whose coverage runs one of those statements (after an import check when the value is not inert) |
+| A top-level `NAME = value`, standard-library import or undecorated def that is edited, added, removed or renamed, when every mention of the names it binds (in `sqlglot/` and `tests/`) is inside a function body | the tests whose coverage runs one of those statements (after an import check when something new runs at import) |
 | Other module- or class-level code (runs at import) | every test whose process loads that module |
 | A test file | the changed tests, or the whole file for module-level edits |
 | A data file under `tests/` | the tests that opened it |

@@ -723,10 +723,23 @@ def _mention_sites(name, defining_path, defining_stmt_lines, removed=False):
     return sites, lams
 
 
-def _binds(st):
+def _binds(st, proven=None, lazy_annotations=False):
     """Names a top-level statement that may be added or removed binds: `NAME = value`
-    (one plain name) or a standard-library import (importing one cannot register
-    anything in sqlglot); None for anything else."""
+    (one plain name), a standard-library import (importing one cannot register
+    anything in sqlglot), or an undecorated def whose defaults are inert and whose
+    annotations are not evaluated (`from __future__ import annotations`) or absent;
+    None for anything else."""
+    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        a = st.args
+        if st.decorator_list or getattr(st, "type_params", None) or proven is None:
+            return None
+        defaults = a.defaults + [d for d in a.kw_defaults if d is not None]
+        if not all(classmap._inert(d, proven) for d in defaults):
+            return None
+        params = a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x is not None]
+        if (st.returns is not None or any(p.annotation is not None for p in params)) and not lazy_annotations:
+            return None
+        return {st.name}
     if isinstance(st, (ast.Assign, ast.AnnAssign)):
         targets = st.targets if isinstance(st, ast.Assign) else [st.target]
         if len(targets) == 1 and isinstance(targets[0], ast.Name) and st.value is not None:
@@ -752,6 +765,14 @@ def module_constants(path, old_tree, new_tree, cov):
     import difflib
     proven = classmap._Proven(old_tree)
     names, needs_import, lines, removed = set(), False, {}, set()
+
+    def lazy(tree):
+        return any(isinstance(s, ast.ImportFrom) and s.module == "__future__"
+                   and any(a.name == "annotations" for a in s.names) for s in tree.body)
+
+    lazy_old, lazy_new = lazy(old_tree), lazy(new_tree)
+    if lazy_old != lazy_new:
+        return None
     da, db = [ast.dump(s) for s in old_tree.body], [ast.dump(s) for s in new_tree.body]
     pairs = []
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=da, b=db, autojunk=False).get_opcodes():
@@ -761,7 +782,7 @@ def module_constants(path, old_tree, new_tree, cov):
             pairs.extend(zip(old_tree.body[i1:i2], new_tree.body[j1:j2]))
             continue
         for st in old_tree.body[i1:i2]:  # removed: later lookups of what it bound change
-            got = _binds(st)
+            got = _binds(st, proven, lazy_old)
             if got is None:
                 return None
             for n in got:
@@ -771,10 +792,12 @@ def module_constants(path, old_tree, new_tree, cov):
                 removed.add(n)
                 lines.setdefault(n, set()).update(range(st.lineno, st.end_lineno + 1))
         for st in new_tree.body[j1:j2]:  # added: it runs at import
-            got = _binds(st)
+            got = _binds(st, proven, lazy_new)
             if got is None:
                 return None
-            if isinstance(st, (ast.Assign, ast.AnnAssign)):
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                pass  # only binds its name (checked above): its body runs when called
+            elif isinstance(st, (ast.Assign, ast.AnnAssign)):
                 if not classmap._inert(st.value, proven):
                     if not classmap._same_callees(st.value, st.value):
                         return None
@@ -791,7 +814,18 @@ def module_constants(path, old_tree, new_tree, cov):
         if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)) and type(a) is type(b):
             if classmap._def_header(a) == classmap._def_header(b):
                 continue  # body edits: line coverage
-            return None
+            # a new header (renamed, new parameters or defaults): every caller of either name
+            ga, gb = _binds(a, proven, lazy_old), _binds(b, proven, lazy_new)
+            if ga is None or gb is None:
+                return None
+            for n in ga | gb:
+                if n.startswith("__"):
+                    return None
+                names.add(n)
+            if a.name != b.name:
+                removed.add(a.name)
+            lines.setdefault(a.name, set()).update(range(a.lineno, a.end_lineno + 1))
+            continue
         if not (isinstance(a, (ast.Assign, ast.AnnAssign)) and type(a) is type(b)):
             return None
         ta = a.targets if isinstance(a, ast.Assign) else [a.target]
