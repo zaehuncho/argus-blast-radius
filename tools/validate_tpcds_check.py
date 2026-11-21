@@ -13,7 +13,11 @@ NODE = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 d = sys.argv[1]
 for cid in sys.argv[2:]:
     text = open(os.path.join(d, cid + ".patch"), encoding="utf-8").read()
-    files = runner.files_from_patch(text)
+    try:
+        files = runner.files_from_patch(text)
+    except ValueError as e:
+        print(json.dumps({"cid": cid, "skipped": str(e)}), flush=True)
+        continue
     chk = runner.run_script(files, ["/app/tpcds_check.py", "--check", "/app/map/tpcds_prints.json"], timeout_s=60)
     res = runner.run_candidates(files, [NODE], timeout_s=600, pool_workers=2)
     truth = "fail" if NODE in res["known_failing"] else "pass" if NODE in res["passed"] else res["status"]
