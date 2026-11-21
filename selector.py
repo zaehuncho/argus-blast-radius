@@ -198,6 +198,68 @@ class Map:
         return res
 
 
+# ---------------------------------------------------------------- TPC-DS check
+#
+# test_execute_tpcds (21.5 s recorded) parses, optimizes, plans, executes and
+# compares 57 TPC-DS queries. When line coverage alone selects it and none of the
+# changed statements runs anywhere in the test except the parse/optimize step
+# (map/tpcds_block.json, tools/build_tpcds_block.sh), tpcds_check.py decides it for
+# about 2.5 s of CPU: identical optimized trees mean identical results.
+
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_BLOCK = os.environ.get("ARGUS_TPCDS_BLOCK", os.path.join(os.path.dirname(MAP), "tpcds_block.json"))
+TPCDS_PRINTS = os.environ.get("ARGUS_TPCDS_PRINTS", os.path.join(os.path.dirname(MAP), "tpcds_prints.json"))
+TPCDS_CHECK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpcds_check.py")
+TPCDS_CHECK_CPU_S = 2.6   # measured 2.51 s in the production image
+TPCDS_P_DROP = 0.5        # share of checks expected to come back identical
+
+
+class TpcdsBlock:
+    def __init__(self, path):
+        with open(path, encoding="utf-8") as fh:
+            self.lines = {f: set(v) for f, v in json.load(fh)["lines"].items()}
+
+    def clear(self, queries):
+        """True when no queried line runs outside the parse/optimize step."""
+        if not queries:
+            return False
+        for path, linenos in queries:
+            block = self.lines.get(path, ())
+            if any(l in block for l in linenos):
+                return False
+        return True
+
+
+TP = None
+try:
+    if os.path.exists(TPCDS_BLOCK) and os.path.exists(TPCDS_PRINTS) and os.path.exists(TPCDS_CHECK):
+        TP = TpcdsBlock(TPCDS_BLOCK)
+except Exception as _e:  # no check, selection unchanged
+    print("tpcds block map unavailable:", repr(_e), file=sys.stderr)
+
+
+class LineLog:
+    """The coverage map for one selection pass. Records the line queries whose answer
+    includes `test`; with drop=True hides `test` from line queries instead, to see
+    whether anything other than line coverage selects it."""
+
+    def __init__(self, cov, test, drop=False):
+        self._cov, self._test, self._drop = cov, test, drop
+        self.queries = []
+
+    def tests_covering(self, path, linenos):
+        linenos = list(linenos)
+        res = self._cov.tests_covering(path, linenos)
+        if self._test in res:
+            if self._drop:
+                return res - {self._test}
+            self.queries.append((path, linenos))
+        return res
+
+    def __getattr__(self, name):
+        return getattr(self._cov, name)
+
+
 # ---------------------------------------------------------------- python analysis
 
 def same_tree(a, b):
@@ -802,6 +864,7 @@ def confirm_by_running(plans, dur, tfile, tid, nodeid_num, every):
         return
     budget = RUN_BUDGET_PER_COMMIT_S * len(plans)
     start = time.monotonic()
+    tpcds_checks(plans, dur, runner, budget, start)
     order = []
     for p in plans:
         sel = p["selected"]
@@ -813,10 +876,11 @@ def confirm_by_running(plans, dur, tfile, tid, nodeid_num, every):
         if static - est >= RUN_MARGIN_S:
             order.append((static - est, est, p))
     order.sort(key=lambda x: -x[0])
-    # A warm fork server answers like a fresh process (runner.py's checks) and
-    # saves 0.1-0.7 s CPU per call; its 0.3-0.8 s start pays off from ~4 calls.
+    # A warm fork server answers like a fresh process (runner.py's checks), but on
+    # the scorer it cost more than it saved (v6.2: 7.0 s CPU against v6.1's 5.3 s
+    # on identical selections), so it is opt-in.
     mode = "fresh"
-    if len(order) >= 4 and not os.environ.get("ARGUS_NO_FORK"):
+    if len(order) >= 4 and os.environ.get("ARGUS_FORK"):
         try:
             runner.start_fork_servers()
             mode = "fork"
@@ -843,6 +907,40 @@ def confirm_by_running(plans, dur, tfile, tid, nodeid_num, every):
                 pass
 
 
+def tpcds_checks(plans, dur, runner, budget, start):
+    """Runs tpcds_check.py for the commits where it applies and pays off; drops
+    test_execute_tpcds where every optimized tree comes out as on the pinned commit."""
+    import time
+    order = []
+    for p in plans:
+        tp, sel = p.get("tpcds_test"), p["selected"]
+        if not p.get("tpcds_check") or tp not in sel:
+            continue
+        static = cost_ms(pack(sel, dur), dur) / 1000
+        without = cost_ms(pack(sel - {tp}, dur), dur) / 1000
+        est = RUN_SCALE * TPCDS_CHECK_CPU_S
+        gain = (static - without) * TPCDS_P_DROP - est
+        if gain >= RUN_MARGIN_S:
+            order.append((gain, est, p))
+    order.sort(key=lambda x: -x[0])
+    for gain, est, p in order:
+        left = budget - (time.monotonic() - start)
+        if left < est * 1.5 + 1:
+            continue
+        try:
+            files = runner.files_from_patch(p["text"])
+            res = runner.run_script(files, [TPCDS_CHECK, "--check", TPCDS_PRINTS], timeout_s=min(20.0, left))
+        except Exception as e:
+            p["reasons"].append(f"tpcds check error {type(e).__name__} -> kept")
+            continue
+        if res.get("status") == "ok" and res.get("exitcode") == 0:
+            p["selected"] = p["selected"] - {p["tpcds_test"]}
+            p["reasons"].append(f"tpcds check identical in {res['cpu_s']:.2f}s cpu -> dropped")
+        else:
+            p["reasons"].append(f"tpcds check {res.get('status')} exit={res.get('exitcode')} "
+                                f"in {res.get('cpu_s', 0):.2f}s cpu -> kept")
+
+
 def _use_result(p, res, nodeid_num):
     """Keeps only the tests the runner saw fail; any inconclusive run keeps the static set."""
     if res.get("failing") is None:
@@ -864,6 +962,7 @@ def main():
     for t in tests:
         tests_by_file.setdefault(t["file"], []).append(t["number"])
     cov = Map(MAP)
+    tp = nodeid_num.get(TPCDS_ID) if TP is not None else None
     cdir = os.path.join(DATA, "commits")
     plans = []
     for name in sorted(os.listdir(cdir)):
@@ -872,13 +971,24 @@ def main():
         cid = name[:-len(".patch")]
         reasons = []
         text = ""
+        check = False
         try:
             text = open(os.path.join(cdir, name), encoding="utf-8", errors="replace").read()
-            selected = select(text, every, cov, tests_by_file, nodeid_num, reasons) & every
+            seen = LineLog(cov, tp)
+            selected = select(text, every, seen, tests_by_file, nodeid_num, reasons) & every
         except Exception as e:  # never crash: a crash rejects the run; a mismatch must not miss
             selected = set(every)
             reasons.append(f"{type(e).__name__} {e} -> all")
-        plans.append({"cid": cid, "text": text, "selected": selected, "reasons": reasons})
+        if tp is not None and tp in selected and selected != every:
+            try:
+                # narrowable only when line coverage alone selected it
+                again = select(text, every, LineLog(cov, tp, drop=True), tests_by_file, nodeid_num, []) & every
+                check = tp not in again and TP.clear(seen.queries)
+            except Exception as e:
+                log(cid, "tpcds check planning error", repr(e))
+            reasons.append(f"tpcds: {'checkable' if check else 'not checkable'}")
+        plans.append({"cid": cid, "text": text, "selected": selected, "reasons": reasons,
+                      "tpcds_test": tp, "tpcds_check": check})
     try:
         confirm_by_running(plans, dur, tfile, tid, nodeid_num, every)
     except Exception as e:  # the static selections stand

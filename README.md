@@ -15,6 +15,13 @@ Builders Buildathon 2026, RWX track. Given a patch to [sqlglot](https://github.c
 | A data file under `tests/` | the tests that opened it |
 | A patched file that no longer parses, renames, added or deleted files, anything unknown | every test |
 
+Class-level edits are narrowed with a class-usage map (`classmap.py`): the tests that read the changed attribute or entered the changed lambda.
+
+After the static pass, two checks run inside the container when the cost model says they pay for their CPU:
+
+- **Run to confirm** (`runner.py`, [RUNNER.md](RUNNER.md)): run a cheap candidate set on the patched tree and keep only the tests that fail.
+- **TPC-DS check** (`tpcds_check.py`): `test_execute_tpcds` (21.5 s) optimizes, plans, executes and compares 57 TPC-DS queries. When line coverage alone selects it and the changed statements run nowhere in that test except the parse/optimize step (`map/tpcds_block.json`), the check re-optimizes the queries on the patched tree (about 2.5 s) and compares every optimized tree with the pinned commit's (types, parent links and shared nodes included). Identical trees feed identical later steps that run unchanged code, so the test passes and is dropped. Any difference keeps it.
+
 Then it packs the chosen tests onto workers: longest first onto the least-loaded worker, trying 1 to 8 workers and keeping the cheapest (busiest worker + 2 s per worker).
 
 ## The maps
@@ -24,6 +31,8 @@ All maps are built from the pinned commit only. There are no answers worked out 
 - `tools/build_coverage.sh` runs sqlglot's suite once with per-test coverage contexts (pytest-cov) and records which files under `tests/` each test opens (`tools/open_tracker.py`).
 - `tools/build_iso_coverage.sh` runs every test alone in a fresh process, following the spawned worker processes that sqlglot's optimizer and executor tests use. Shared caches and lazy imports credit code only to the first test that touches it in a single run; isolation fixes that.
 - `tools/make_map.py` merges both into `map/cov.sqlite`. It deduplicates line bitmaps, so the file stays a few MB.
+- `tools/build_tpcds_block.sh` and `tools/make_tpcds_block.py` build `map/tpcds_block.json`. For each TPC-DS query, a fresh process runs everything `test_execute_tpcds` does after the optimize step, with optimize stubbed to return the pinned commit's tree, under coverage. The image build fingerprints the pinned commit's optimized trees (`tpcds_check.py --build`).
+- Validation (local only): `tools/validate_tpcds_check.py` compares the check with full runs of the test on mutants (`tools/gen_tpcds_mutants.py`).
 
 ## Run it
 

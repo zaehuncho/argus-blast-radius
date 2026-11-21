@@ -416,10 +416,10 @@ def _wait_rusage(pid):
             continue
 
 
-def _execute_fresh(args, env, cwd, logpath, deadline):
+def _execute_fresh(args, env, cwd, logpath, deadline, prefix=("-m", "pytest")):
     """`python -m pytest args` in a new session. Returns (exitcode, cpu_s, timed_out)."""
     with open(logpath, "wb") as logf, _active_lock:
-        proc = subprocess.Popen([sys.executable, "-m", "pytest", *args], cwd=cwd, env=env,
+        proc = subprocess.Popen([sys.executable, *prefix, *args], cwd=cwd, env=env,
                                 stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
                                 start_new_session=True)
         _active_pids.add(proc.pid)
@@ -615,7 +615,7 @@ def stop_fork_servers():
 
 def run_candidates(patched_files, nodeids, timeout_s=60.0, per_test_timeout_s=None,
                    src=SRC, keep_dir=False, missing_as_failing=True, pool_workers=1,
-                   mode=None, preload=DEFAULT_PRELOAD):
+                   mode=None, preload=DEFAULT_PRELOAD, extra_env=None):
     """Runs nodeids on src with patched_files applied.
 
     Returns {failing, cpu_s, wall_s, status, missing, collect_errors, exitcode,
@@ -660,8 +660,8 @@ def run_candidates(patched_files, nodeids, timeout_s=60.0, per_test_timeout_s=No
             json.dump(nodeids, fh)
         tmpdir = os.path.join(run, "tmp")
         os.mkdir(tmpdir)
-        env = _child_env({"PYTHONPATH": root + os.pathsep + _plugin_dir(), "ARGUS_RESULTS": results,
-                          "ARGUS_WANT": want, "TMPDIR": tmpdir}, pool_workers)
+        env = _child_env({**(extra_env or {}), "PYTHONPATH": root + os.pathsep + _plugin_dir(),
+                          "ARGUS_RESULTS": results, "ARGUS_WANT": want, "TMPDIR": tmpdir}, pool_workers)
         if per_test_timeout_s is None:
             per_test_timeout_s = max(1.0, timeout_s / 2)
         args = [*PYTEST_ARGS, f"--rootdir={root}", f"--timeout={per_test_timeout_s:g}", *files]
@@ -761,6 +761,35 @@ def run_candidates(patched_files, nodeids, timeout_s=60.0, per_test_timeout_s=No
         res["wall_s"] = time.monotonic() - t0
         if not keep_dir:
             shutil.rmtree(run, ignore_errors=True)
+
+
+def run_script(patched_files, argv, timeout_s=30.0, src=SRC, extra_env=None):
+    """Runs `python *argv` with the overlay of src plus patched_files as working
+    directory and PYTHONPATH, environment as for run_candidates. Returns
+    {exitcode, cpu_s, status ("ok" or "timeout"), log_tail}."""
+    t0 = time.monotonic()
+    res = {"exitcode": None, "cpu_s": 0.0, "status": "", "log_tail": ""}
+    _become_subreaper()
+    _reap_orphans()
+    run = tempfile.mkdtemp(prefix="argus-run-", dir=TMP)
+    try:
+        root = build_overlay(os.path.join(run, "repo"), patched_files, src)
+        tmpdir = os.path.join(run, "tmp")
+        os.mkdir(tmpdir)
+        env = _child_env({**(extra_env or {}), "PYTHONPATH": root, "TMPDIR": tmpdir}, 1)
+        logpath = os.path.join(run, "script.log")
+        exitcode, cpu, timed_out = _execute_fresh(list(argv), env, root, logpath, t0 + timeout_s, prefix=())
+        res.update(exitcode=exitcode, cpu_s=cpu, status="timeout" if timed_out else "ok")
+        try:
+            with open(logpath, "rb") as fh:
+                fh.seek(max(0, os.path.getsize(logpath) - 2000))
+                res["log_tail"] = fh.read().decode("utf-8", "replace")
+        except OSError:
+            pass
+        return res
+    finally:
+        _reap_orphans()
+        shutil.rmtree(run, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- build time
