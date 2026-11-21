@@ -15,6 +15,9 @@ class-attribute values were consumed while another class was being created
         v.tests        set of tests for all class-level changes, or None = keep the broad rule
         v.func_ranges  [(lo, hi)] old-line body ranges of functions whose code changed; the
                        caller must add the tests whose coverage runs any of those lines
+        v.extra        [(path, lo, hi, limit)] more coverage to add: the tests that run any of
+                       those lines of `path`, intersected with `limit` unless it is None
+                       (classmap.narrow() applies both)
         v.reason       short text for the log
 
 The rule is deliberately narrow. It answers only when every changed statement is
@@ -30,12 +33,44 @@ Everything else returns None.
 """
 import ast
 import json
+import os
 import re
 import sqlite3
 import zlib
 from collections import namedtuple
 
-Verdict = namedtuple("Verdict", "tests reason func_ranges")
+# extra = [(path, lo, hi, limit)]: add the tests whose coverage runs any of those lines of
+# `path`, intersected with `limit` when it is a set. narrow() applies it.
+Verdict = namedtuple("Verdict", "tests reason func_ranges extra", defaults=((),))
+
+# Facts about the creation hooks at the pinned commit, on top of the map's own table:
+# hook -> attribute -> the attributes of the class being created that are computed from it.
+# _TokenizerBase.__init_subclass__ uses cls.KEYWORDS for two things only: whether HINT_START
+# is a keyword (an entry of cls._COMMENTS) and the keys of cls._KEYWORD_TRIE.
+# _Dialect.__new__ uses the tokenizer's KEYWORDS only for `"(+)" in KEYWORDS`.
+HOOK_DERIVED = {
+    "sqlglot/tokens.py:_TokenizerBase.__init_subclass__": {"KEYWORDS": ["_COMMENTS", "_KEYWORD_TRIE"]},
+    "sqlglot/dialects/dialect.py:_Dialect.__new__": {"KEYWORDS": ["SUPPORTS_COLUMN_JOIN_MARKS"]},
+}
+
+# Rule for constants reused as parameter defaults (`def f(x=NAME)` in the class body or
+# `def f(x=C.NAME)` elsewhere). Off: such an edit keeps the broad rule, as any other reuse
+# inside the class body does. When on, the edit selects the tests that run those defs'
+# bodies plus the call-time readers, which relies on the FREE_LOOKUPS tables below.
+DEFAULT_ARG_RULE = False
+
+# Used only when DEFAULT_ARG_RULE is on.
+# Every place at the pinned commit (sqlglot/ and tests/) where an attribute is looked up
+# under a computed name on an object that could be of any class (tools/classmap_dynsites.py
+# lists all computed-name lookups; the others are on modules, on Token slots, or only on
+# names ending in "_sql"). (path, first line, last line, text expected on the first line)
+FREE_LOOKUPS = [
+    ("sqlglot/generators/duckdb.py", 1434, 1434, "getattr(annotated, return_value_attr)"),
+    ("sqlglot/expressions/core.py", 2488, 2495, "return _Struct("),
+    ("tests/test_schema.py", 429, 429, "getattr(schema, method)"),
+]
+# the same, inside a one-line lambda: the tests that called the lambda
+FREE_LOOKUP_LAMBDAS = [("sqlglot/executor/env.py", 283, "getattr(e, this)")]
 
 # Attributes whose edit changes state outside the classes involved:
 # _Dialect.__new__ pops entries from the generator's TRANSFORMS dict based on it.
@@ -164,6 +199,142 @@ def _reuses(cls_node, name):
             if isinstance(n, ast.Name) and n.id == name and id(n) not in own:
                 return True
     return False
+
+
+def _reuse_sites(cls_node, name):
+    """How the class body uses `name` besides binding it. Returns a list of
+    ("pop", key) for a statement `NAME.pop("key")` (key None for the two-argument form,
+    which cannot fail) and ("default", def node) for an undecorated def whose parameter
+    default is exactly NAME; or None if it is used in any other way."""
+    own = set()
+    for s in cls_node.body:
+        if _key(s) == ("attr", name):
+            own.add(id(s.targets[0] if isinstance(s, ast.Assign) else s.target))
+    out = []
+    for s in cls_node.body:
+        uses = [n for n in _import_level(s) if isinstance(n, ast.Name) and n.id == name and id(n) not in own]
+        if not uses:
+            continue
+        if (
+            isinstance(s, ast.Expr)
+            and isinstance(s.value, ast.Call)
+            and isinstance(s.value.func, ast.Attribute)
+            and s.value.func.attr == "pop"
+            and s.value.func.value is uses[0]
+            and len(uses) == 1
+            and len(s.value.args) in (1, 2)
+            and not s.value.keywords
+            and all(isinstance(a, ast.Constant) for a in s.value.args)
+        ):
+            out.append(("pop", s.value.args[0].value if len(s.value.args) == 1 else None))
+        elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and not s.decorator_list:
+            defaults = s.args.defaults + [d for d in s.args.kw_defaults if d is not None]
+            if not all(any(u is d for d in defaults) for u in uses):
+                return None
+            out.append(("default", s))
+        else:
+            return None
+    return out
+
+
+def _reuse_signature(sites):
+    return [(k, v if k == "pop" else _def_header(v)) for k, v in sites]
+
+
+class _Sources:
+    """The pinned sqlglot/ and tests/ sources, read once, to find where a name is mentioned."""
+
+    def __init__(self, root):
+        self.root, self.files = root, None
+
+    def _load(self):
+        self.files = {}
+        for top in ("sqlglot", "tests"):
+            for d, _, fs in os.walk(os.path.join(self.root, top)):
+                for f in fs:
+                    if f.endswith(".py"):
+                        full = os.path.join(d, f)
+                        try:
+                            with open(full, "rb") as fh:
+                                self.files[os.path.relpath(full, self.root).replace(os.sep, "/")] = fh.read()
+                        except OSError:
+                            pass
+
+    def line(self, path, lineno):
+        if self.files is None:
+            self._load()
+        data = self.files.get(path)
+        if data is None:
+            return ""
+        lines = data.split(b"\n")
+        return lines[lineno - 1].decode("utf-8", "replace") if lineno <= len(lines) else ""
+
+    def maybe_default(self, name):
+        """Cheap text test: could some def use `<something>.NAME` as a parameter default?
+        Only decides whether mentions() is worth running."""
+        if self.files is None:
+            self._load()
+        needle = name.encode()
+        pat = re.compile(rb"=\s*[\w.]+\." + re.escape(needle) + rb"\s*[,)]")
+        return any(needle in data and pat.search(data) for data in self.files.values())
+
+    def mentions(self, name):
+        """Every `x.NAME` and every string "NAME" in the sources, classified:
+        ("default", path, lo, hi)  the default of an undecorated def that runs at import;
+                                   lo..hi is the def's body
+        ("call", path, lo, hi)     inside a def body; lo..hi is that body
+        ("import", path, lo, hi)   anything else evaluated at import, lambda bodies included
+        Returns None if a file that mentions the name does not parse."""
+        if self.files is None:
+            self._load()
+        needle = name.encode()
+        out = []
+        for path, data in self.files.items():
+            if needle not in data:
+                continue
+            try:
+                tree = ast.parse(data)
+            except (SyntaxError, ValueError):
+                return None
+
+            def hit(n):
+                return (isinstance(n, ast.Attribute) and n.attr == name and isinstance(n.ctx, ast.Load)) or (
+                    isinstance(n, ast.Constant) and n.value == name
+                )
+
+            def walk(node, body):
+                # body = (lo, hi) of the innermost enclosing def body, None at import level
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        defaults = child.args.defaults + [d for d in child.args.kw_defaults if d is not None]
+                        rng = _body_range(child)
+                        for d in defaults:
+                            if hit(d) and body is None and not child.decorator_list:
+                                out.append(("default", path, rng[0], rng[1]))
+                            else:
+                                visit(d, body)
+                        for x in child.decorator_list:
+                            visit(x, body)
+                        for a in ast.walk(child.args):
+                            if isinstance(a, ast.arg) and a.annotation is not None:
+                                visit(a.annotation, body)
+                        if child.returns is not None:
+                            visit(child.returns, body)
+                        for x in child.body:
+                            visit(x, rng)
+                    else:
+                        visit(child, body)
+
+            def visit(n, body):
+                if hit(n):
+                    if body is None:
+                        out.append(("import", path, n.lineno, n.end_lineno))
+                    else:
+                        out.append(("call", path, body[0], body[1]))
+                walk(n, body)
+
+            walk(tree, None)
+        return out
 
 
 class _Proven:
@@ -404,7 +575,14 @@ class ClassMap:
         self.nofunc = set(json.loads(meta["nofunc"]))    # tests recorded with data attributes only
         self.ntests = int(meta["ntests"])
         self.no_lambda = set(json.loads(meta["no_lambda"]))  # tests whose lambda record is unusable
+        for hook, table in HOOK_DERIVED.items():
+            if hook in self.hooks:
+                merged = dict(table)
+                merged.update(self.hooks[hook].get("derived", {}))
+                self.hooks[hook]["derived"] = merged
         self._blobs = {}
+        self._sources = _Sources(os.environ.get("ARGUS_SQLGLOT", "/app/sqlglot"))
+        self._extra, self._path = [], None
 
     # -- raw lookups
     def _tests(self, bid):
@@ -492,12 +670,16 @@ class ClassMap:
         """Hook `hook` read attribute `src` while creating class `k`. If we know exactly
         which attributes of `k` it computes from `src`, follow those; else taint `k`."""
         derived = self.hooks[hook].get("derived", {}).get(src)
-        if derived is None:
-            self._taint(k, tests, seen)
-            return
         c = self.cls.get(k)
         if c is None or not c["tracked"]:
             raise Broad(f"value consumed while creating untracked class {k}")
+        if derived is not None and self.hooks[hook]["owner"] not in [k] + c["mro"]:
+            # The hook ran for a class made inside k's creation (a dialect's default
+            # Tokenizer): what it computed is stored on that class, not on k.
+            derived = None
+        if derived is None:
+            self._taint(k, tests, seen)
+            return
         for r in derived:
             if (k, r) in seen:
                 continue
@@ -507,6 +689,37 @@ class ClassMap:
                 if reader not in self.hooks:
                     raise Broad(f"{k}.{r} is consumed by {reader} while creating {k2}")
                 self._consume(k2, reader, r, tests, seen)
+
+    def _refine(self, cname, name, readers):
+        """Recorded readers include every test whose process ran an import-time read. When
+        the only import-time reads of `name` are parameter defaults (`def f(x=C.NAME)`),
+        the value matters to a test only if it runs such a def's body, or really reads the
+        attribute at call time. Returns the tests for the call-time reads and queues the
+        coverage lookups in self._extra; None if the import-time reads are anything else
+        (the caller then keeps all recorded readers)."""
+        if not DEFAULT_ARG_RULE:
+            return None
+        if name.endswith("_sql") or cname.startswith("sqlglot.tokenizer_core:"):
+            return None  # names and classes the computed-name lookups can reach
+        sites = self._sources.mentions(name)
+        if sites is None or not any(k == "default" for k, *_ in sites):
+            return None
+        if any(k == "import" for k, *_ in sites):
+            return None
+        for path, lo, _, text in FREE_LOOKUPS:
+            if text not in self._sources.line(path, lo):
+                return None  # not the sources this table was made from
+        for path, line, text in FREE_LOOKUP_LAMBDAS:
+            if text not in self._sources.line(path, line):
+                return None
+        got = set()
+        for path, line, _ in FREE_LOOKUP_LAMBDAS:
+            got |= self.entered(path, line) & readers
+        for kind, path, lo, hi in set(sites):
+            self._extra.append((path, lo, hi, None if kind == "default" else readers))
+        for path, lo, hi, _ in FREE_LOOKUPS:
+            self._extra.append((path, lo, hi, readers))
+        return got
 
     def _defined_above(self, cname, attr):
         """True if lookups of `attr` that pass this class are answered by a tracked
@@ -533,8 +746,28 @@ class ClassMap:
             raise Broad(f"{cname}.{name}: not a tracked attribute")
         if sa is None and not self._defined_above(cname, name):
             raise Broad(f"{cname}.{name}: new name, lookups that used to fail are not recorded")
-        if self._T.mentions(ca, cb, name) and (_reuses(ca, name) or _reuses(cb, name)):
-            raise Broad(f"{cname}.{name}: used again inside the class body")
+        default_defs = []
+        if self._T.mentions(ca, cb, name):
+            ra, rb = _reuse_sites(ca, name), _reuse_sites(cb, name)
+            if ra is None or rb is None or _reuse_signature(ra) != _reuse_signature(rb):
+                raise Broad(f"{cname}.{name}: used again inside the class body")
+            if ra:
+                # Only two reuses are understood, and only for a changed plain value.
+                if kind != "attr" or sa is None or sb is None:
+                    raise Broad(f"{cname}.{name}: used again inside the class body")
+                popped = {k for kd, k in ra if kd == "pop" and k is not None}
+                if any(kd == "pop" for kd, _ in ra):
+                    # NAME.pop("key") right after the literal: it must still find its key
+                    va, vb = _value(sa), _value(sb)
+                    if not (isinstance(va, ast.Dict) and isinstance(vb, ast.Dict)):
+                        raise Broad(f"{cname}.{name}: popped in the class body and not a dict literal")
+                    keys_a = {k.value for k in va.keys if isinstance(k, ast.Constant)}
+                    keys_b = {k.value for k in vb.keys if isinstance(k, ast.Constant)}
+                    if (popped & keys_a) - keys_b:
+                        raise Broad(f"{cname}.{name}: a key popped in the class body was edited")
+                default_defs = [d for kd, d in ra if kd == "default"]
+                if default_defs and not DEFAULT_ARG_RULE:
+                    raise Broad(f"{cname}.{name}: used again inside the class body")
         strict = False
         if kind == "attr":
             if sa is not None and sb is not None:
@@ -585,7 +818,21 @@ class ClassMap:
                 self._consume(cname, h, name, tests, seen)
             for k, reader in edges:
                 self._consume(k, reader, name, tests, seen)
-        tests |= self._readers(cname, name)
+        readers = self._readers(cname, name)
+        if default_defs and (own_hooks or edges):
+            raise Broad(f"{cname}.{name}: a parameter default and read while classes are created")
+        for d in default_defs:
+            # the value was copied into the def's defaults: whoever runs its body may use it
+            lo, hi = _body_range(d)
+            self._extra.append((self._path, lo, hi, None))
+        refined = None
+        if kind == "attr" and sa is not None and sb is not None and not own_hooks and not edges:
+            if DEFAULT_ARG_RULE and (default_defs or self._sources.maybe_default(name)):
+                refined = self._refine(cname, name, readers)
+        if refined is None:
+            tests |= readers
+        else:
+            tests |= refined
         callable_attr = (
             kind == "def"
             or name in c["fn"]
@@ -649,6 +896,7 @@ class ClassMap:
         funcs = old-line body ranges of functions whose code changed, lams = changed lambdas.
         Raises Broad when anything else changed."""
         mod = module_of(path)
+        self._path, self._extra = path, []
         edits, lams = [], []
         funcs = [] if funcs is None else funcs
         if len(old.body) != len(new.body):
@@ -702,7 +950,7 @@ class ClassMap:
         if lams:
             parts.append("lambdas at " + ",".join(str(l.lineno) for l in lams))
         reason = "; ".join(parts) or "function bodies only"
-        return Verdict(tests, reason, funcs)
+        return Verdict(tests, reason, funcs, tuple(self._extra))
 
 
 def narrow(cm, cov, path, old_text, new_text, old_tree=None, new_tree=None):
@@ -717,4 +965,7 @@ def narrow(cm, cov, path, old_text, new_text, old_tree=None, new_tree=None):
     tests = set(v.tests)
     for lo, hi in v.func_ranges:
         tests |= cov.tests_covering(path, range(lo, hi + 1))
+    for p, lo, hi, limit in v.extra:
+        got = cov.tests_covering(p, range(lo, hi + 1))
+        tests |= got if limit is None else got & limit
     return tests, v.reason
