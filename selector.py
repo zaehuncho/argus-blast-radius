@@ -773,10 +773,10 @@ def cost_ms(workers, dur):
 # Runner CPU model from runner.py's measurements (fixed s, s per recorded s), scaled
 # by 1.5: the scorer's machine used ~22 s of runner CPU on a batch where ours
 # predicted roughly two thirds of that.
-RUN_SCALE = 1.5
+RUN_SCALE = float(os.environ.get("ARGUS_RUN_SCALE", "1.5"))
 RUN_MODEL = {k: (f * RUN_SCALE, p * RUN_SCALE) for k, (f, p) in
              {"plain": (0.45, 1.0), "optimizer": (1.25, 1.4), "executor": (2.2, 2.0)}.items()}
-RUN_MARGIN_S = 1.0          # run only if predicted CPU is this much below the static cost
+RUN_MARGIN_S = float(os.environ.get("ARGUS_RUN_MARGIN", "1.0"))          # run only if predicted CPU is this much below the static cost
 RUN_BUDGET_PER_COMMIT_S = 2.0
 RUN_TIMEOUT_S = 25.0
 
@@ -813,23 +813,44 @@ def confirm_by_running(plans, dur, tfile, tid, nodeid_num, every):
         if static - est >= RUN_MARGIN_S:
             order.append((static - est, est, p))
     order.sort(key=lambda x: -x[0])
-    for gain, est, p in order:
-        left = budget - (time.monotonic() - start)
-        if left < est * 1.5 + 1:
-            continue
+    # A warm fork server answers like a fresh process (runner.py's checks) and
+    # saves 0.1-0.7 s CPU per call; its 0.3-0.8 s start pays off from ~4 calls.
+    mode = "fresh"
+    if len(order) >= 4 and not os.environ.get("ARGUS_NO_FORK"):
         try:
-            files = runner.files_from_patch(p["text"])
-            res = runner.run_candidates(files, sorted(tid[t] for t in p["selected"]),
-                                        timeout_s=min(RUN_TIMEOUT_S, left))
+            runner.start_fork_servers()
+            mode = "fork"
         except Exception as e:
-            p["reasons"].append(f"runner error {type(e).__name__} -> static")
-            continue
-        if res.get("failing") is None:
-            p["reasons"].append(f"runner {res.get('status')} -> static")
-            continue
-        failing = {nodeid_num[n] for n in res["failing"] if n in nodeid_num}
-        p["reasons"].append(f"runner ran {len(p['selected'])} in {res.get('cpu_s', 0):.2f}s cpu -> {len(failing)} fail")
-        p["selected"] = failing
+            log("fork server unavailable:", repr(e))
+    try:
+        for gain, est, p in order:
+            left = budget - (time.monotonic() - start)
+            if left < est * 1.5 + 1:
+                continue
+            try:
+                files = runner.files_from_patch(p["text"])
+                res = runner.run_candidates(files, sorted(tid[t] for t in p["selected"]),
+                                            timeout_s=min(RUN_TIMEOUT_S, left), mode=mode)
+            except Exception as e:
+                p["reasons"].append(f"runner error {type(e).__name__} -> static")
+                continue
+            _use_result(p, res, nodeid_num)
+    finally:
+        if mode == "fork":
+            try:
+                runner.stop_fork_servers()
+            except Exception:
+                pass
+
+
+def _use_result(p, res, nodeid_num):
+    """Keeps only the tests the runner saw fail; any inconclusive run keeps the static set."""
+    if res.get("failing") is None:
+        p["reasons"].append(f"runner {res.get('status')} -> static")
+        return
+    failing = {nodeid_num[n] for n in res["failing"] if n in nodeid_num}
+    p["reasons"].append(f"runner ran {len(p['selected'])} in {res.get('cpu_s', 0):.2f}s cpu -> {len(failing)} fail")
+    p["selected"] = failing
 
 
 def main():
