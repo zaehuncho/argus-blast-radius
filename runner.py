@@ -228,6 +228,20 @@ def _apply(old_text, hunks, path):
     out, pos = [], 0
     for old_start, old_len, body in hunks:
         start = old_start if old_len == 0 else old_start - 1
+        block = [t for tag, t in body if tag in " -"]
+        if block and not (start >= pos and old[start:start + len(block)] == block):
+            # nearest offset where the hunk's old lines all match, as `git apply` does
+            found = None
+            for d in range(1, len(old) + 1):
+                for at in (start - d, start + d):
+                    if pos <= at <= len(old) - len(block) and old[at:at + len(block)] == block:
+                        found = at
+                        break
+                if found is not None or (start - d < pos and start + d > len(old) - len(block)):
+                    break
+            if found is None:
+                raise ValueError(f"{path}: hunk at {old_start} does not match")
+            start = found
         if start < pos or start > len(old):
             raise ValueError(f"{path}: hunk at {old_start} out of order or range")
         out.extend(old[pos:start])

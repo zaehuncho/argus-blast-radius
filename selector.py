@@ -59,15 +59,16 @@ def parse_patch(text):
         if line.startswith("diff --git "):
             cur = {"old": None, "new": None, "hunks": []}
             files.append(cur)
-            m = re.match(r"diff --git a/(.*) b/(.*)$", line)
+            # either prefix order: `git diff -R` writes b/ for the old side
+            m = re.match(r"diff --git [ab]/(.*) [ab]/(.*)$", line)
             if m:
                 cur["old"], cur["new"] = m.group(1), m.group(2)
         elif line.startswith("--- ") and cur is not None and not cur["hunks"]:
             p = line[4:].split("\t")[0]
-            cur["old"] = None if p == "/dev/null" else re.sub(r"^a/", "", p)
+            cur["old"] = None if p == "/dev/null" else re.sub(r"^[ab]/", "", p)
         elif line.startswith("+++ ") and cur is not None and not cur["hunks"]:
             p = line[4:].split("\t")[0]
-            cur["new"] = None if p == "/dev/null" else re.sub(r"^b/", "", p)
+            cur["new"] = None if p == "/dev/null" else re.sub(r"^[ab]/", "", p)
         elif line.startswith("rename from ") and cur is not None:
             cur["old"] = line[len("rename from "):]
         elif line.startswith("rename to ") and cur is not None:
@@ -102,6 +103,24 @@ class PatchMismatch(Exception):
     """The patch's context or removed lines do not match the pinned file."""
 
 
+def _locate(old, start, block, lo):
+    """Where a hunk's old lines (context and removed) sit: at `start` if they match
+    there, else at the nearest offset (not before `lo`) where they all match exactly,
+    as `git apply` does for a patch made against slightly different line numbers."""
+    def fits(at):
+        return at + len(block) <= len(old) and all(old[at + k].rstrip("\r") == b for k, b in enumerate(block))
+
+    if start >= lo and fits(start):
+        return start
+    for d in range(1, len(old) + 1):
+        for at in (start - d, start + d):
+            if lo <= at <= len(old) - len(block) and fits(at):
+                return at
+        if start - d < lo and start + d > len(old) - len(block):
+            break
+    raise PatchMismatch(f"context differs at line {start + 1}")
+
+
 def apply_hunks(old_text, hunks):
     """Applies hunks to old_text. Returns (new_text, changed_old_lines).
 
@@ -113,7 +132,11 @@ def apply_hunks(old_text, hunks):
     pos = 0  # 0-based index into old
     edits = 0
     for old_start, body in hunks:
-        start = max(old_start - 1, 0)
+        block = [t.rstrip("\r") for tag, t in body if tag in (" ", "-")]
+        if not block:
+            start = old_start  # `@@ -N,0`: an insertion after old line N
+        else:
+            start = _locate(old, max(old_start - 1, 0), block, pos)
         if start < pos:
             raise PatchMismatch("overlapping hunks")
         out.extend(old[pos:start])
@@ -357,6 +380,49 @@ def _text(lines, node):
     return "\n".join(lines[first_line(node) - 1:node.end_lineno])
 
 
+def _same_skeleton(xs, ys, la, lb):
+    """True when two module (or class) bodies hold the same statements outside
+    function bodies: the same defs and classes by name and order, and every other
+    statement unchanged. Line coverage of changed lines only sees edits to existing
+    lines; code added past them (a new method after an edited last line, in one diff
+    run) shows up here."""
+    if len(xs) != len(ys):
+        return False
+    for x, y in zip(xs, ys):
+        if type(x) is not type(y):
+            return False
+        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if x.name != y.name:
+                return False
+            continue  # header and body edits are on changed lines
+        if isinstance(x, ast.ClassDef):
+            if x.name != y.name or not _same_skeleton(x.body, y.body, la, lb):
+                return False
+            continue
+        if _text(la, x) != _text(lb, y) and _dump_no_lambda_bodies(x) != _dump_no_lambda_bodies(y):
+            return False
+    return True
+
+
+def _dump_no_lambda_bodies(node):
+    """ast.dump with every lambda body left out: edits inside a lambda body are on
+    changed lines and handled there (the tests that entered the lambda)."""
+    if isinstance(node, ast.Lambda):
+        return "Lambda(" + ast.dump(node.args) + ")"
+    if isinstance(node, list):
+        return "[" + ",".join(_dump_no_lambda_bodies(x) for x in node) + "]"
+    if not isinstance(node, ast.AST):
+        return repr(node)
+    return type(node).__name__ + "(" + ",".join(
+        f"{k}={_dump_no_lambda_bodies(v)}" for k, v in ast.iter_fields(node)) + ")"
+
+
+def _lazy_annotations(tree):
+    """`from __future__ import annotations`: annotations are not evaluated at def time."""
+    return any(isinstance(s, ast.ImportFrom) and s.module == "__future__"
+               and any(a.name == "annotations" for a in s.names) for s in tree.body)
+
+
 def _dump(node, norm):
     if norm:
         import copy
@@ -466,8 +532,9 @@ def stdlib_imports_only(old_tree, new_tree, old_text, new_text):
             continue
         if d in old_dumps:
             return False  # an existing import moved past other statements
-        if _bound(n) & old_names:
-            return False  # a new import that binds a name the module already used
+        # an added import is left to the module rule: it can fail at import (a name the
+        # module does not have) or shadow a star-exported name in sqlglot.expressions
+        return False
     for s, d, n in oi:
         if d not in new_dumps and _bound(n) & new_names:
             return False  # a removed import whose name is still used
@@ -505,6 +572,15 @@ def signature_defaults_only(old_def, new_tree, old_tree):
     for o, n in zip(oa.defaults + oa.kw_defaults, na.defaults + na.kw_defaults):
         same = (ast.dump(o) if o is not None else None) == (ast.dump(n) if n is not None else None)
         if not same and not (_inert(o) and _inert(n)):
+            return False
+    if not _lazy_annotations(old_tree):
+        # annotations are evaluated when the def runs (at import): a changed one can raise there
+        def anns(d):
+            a = d.args
+            params = a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x is not None]
+            return [ast.dump(p.annotation) if p.annotation is not None else None for p in params] + [
+                ast.dump(d.returns) if d.returns is not None else None]
+        if anns(old_def) != anns(new_def):
             return False
     saved = (old_def.args, new_def.args, old_def.returns, new_def.returns)
     try:
@@ -653,39 +729,98 @@ def _tree(rel):
     return _TREES[rel]
 
 
+_STAR = None
+
+
+def _import_source(rel, node):
+    """The absolute module an ImportFrom in file `rel` imports from."""
+    if not node.level:
+        return node.module or ""
+    me = classmap.module_of(rel)
+    pkg = (me if rel.endswith("__init__.py") else me.rsplit(".", 1)[0]).split(".")
+    base = pkg[:len(pkg) - (node.level - 1)] if node.level > 1 else pkg
+    return ".".join(base + ([node.module] if node.module else []))
+
+
+def _star_importers():
+    """{module: set of modules that do `from module import *`} over sqlglot/ and tests/."""
+    global _STAR
+    if _STAR is None:
+        _STAR = {}
+        for rel, text in _sources().items():
+            if "import *" not in text:
+                continue
+            me = classmap.module_of(rel)
+            for node in ast.walk(_tree(rel)):
+                if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+                    _STAR.setdefault(_import_source(rel, node), set()).add(me)
+    return _STAR
+
+
+def _name_scope(defining_path):
+    """(files, modules) where a top-level name of this module is visible as a plain
+    name: the module itself and every module that star-imports it, in any chain."""
+    star = _star_importers()
+    mods, todo = set(), [classmap.module_of(defining_path)]
+    while todo:
+        m = todo.pop()
+        if m in mods:
+            continue
+        mods.add(m)
+        todo.extend(star.get(m, ()))
+    return {rel for rel in _sources() if classmap.module_of(rel) in mods}, mods
+
+
 def _mention_sites(name, defining_path, defining_stmt_lines, removed=False):
     """[(path, first line, last line)] of the statements inside function bodies that
-    mention `name` (as a name, attribute or string), and [(path, line)] of the lambdas
-    built at import whose bodies mention it; None if any mention is evaluated at import
-    time, a docstring mentions it (doctests), or it is imported under another name."""
+    mention `name` (as a name where it is visible, an attribute anywhere, or a string
+    that is the name or ends in ".name"), and [(path, line)] of the lambdas built at
+    import whose bodies mention it; None if any mention is evaluated at import time or
+    it is imported under another name."""
     word = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])")
     sites, lams = [], []
+    scope, mods = _name_scope(defining_path)
     for rel, text in _sources().items():
         if name not in text or not word.search(text):
             continue
         tree = _tree(rel)
+        # a plain `name` here is this module's binding only if the file can see it: the
+        # module, its star importers, or a file doing `from <one of those> import name`
+        plain = rel in scope or any(
+            isinstance(n, ast.ImportFrom) and _import_source(rel, n) in mods
+            and any(name in (a.name, a.asname) for a in n.names)
+            for n in ast.walk(tree))
 
         def visit(node, stmt, in_body, in_all, lam=None):
             hit = False
-            if isinstance(node, ast.Name) and node.id == name:
+            if plain and isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
+                if not in_body:
+                    return False  # `NAME += ...` at import reads the old value
+                sites.append((rel, stmt.lineno, stmt.end_lineno))
+            if plain and isinstance(node, ast.Name) and node.id == name:
                 hit = not isinstance(node.ctx, ast.Store) or in_body
             elif isinstance(node, ast.Attribute) and node.attr == name:
                 hit = True
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and word.search(node.value):
-                if in_all and removed:
-                    return False  # a star import of a listed but removed name fails
-                if not in_all:
-                    if not in_body or node.value != name:
-                        return False  # docstrings and other text: doctests could read it
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and (
+                    node.value == name or node.value.endswith("." + name)):
+                # getattr(x, "NAME"), mock.patch("sqlglot.m.NAME"), __all__ entries; other text
+                # (docstrings, messages) cannot reach the binding: doctests are not collected
+                if in_all:
+                    if removed:
+                        return False  # a star import of a listed but removed name fails
+                else:
                     hit = True
-            elif isinstance(node, ast.alias) and (node.name == name or node.name.endswith("." + name)):
-                if node.asname and node.asname != name:
-                    return False  # uses under the other name are not found by this search
-                if in_body:
-                    hit = True
-                elif removed:
-                    return False  # a top-level `from m import NAME` of a removed name fails at import
-                # a top-level `from m import NAME` only binds it; its uses are found as names
+            elif isinstance(node, ast.ImportFrom) and _import_source(rel, node) in mods:
+                for a in node.names:
+                    if a.name != name:
+                        continue
+                    if a.asname and a.asname != name:
+                        return False  # uses under the other name are not found by this search
+                    if in_body:
+                        hit = True
+                    elif removed:
+                        return False  # a top-level `from m import NAME` of a removed name fails at import
+                    # a top-level `from m import NAME` only binds it; its uses are found as names
             if hit:
                 if not in_body:
                     if rel == defining_path and stmt is not None and stmt.lineno in defining_stmt_lines:
@@ -800,9 +935,7 @@ def module_constants(path, old_tree, new_tree, cov):
                 pass  # only binds its name (checked above): its body runs when called
             elif isinstance(st, (ast.Assign, ast.AnnAssign)):
                 if not classmap._inert(st.value, proven):
-                    if not classmap._same_callees(st.value, st.value):
-                        return None
-                    needs_import = True
+                    return None  # a new call at import could act on anything
             else:
                 needs_import = True  # the imported names must exist
             for n in got:
@@ -818,7 +951,7 @@ def module_constants(path, old_tree, new_tree, cov):
             ga, gb = _binds(a, proven, lazy_old), _binds(b, proven, lazy_new)
             if ga is None or gb is None:
                 return None
-            if a.name == b.name:
+            if a.name == b.name and not any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(a)):
                 # same name, new parameters or defaults: the function object is still found
                 # wherever it was (tables built at import included), and every call that
                 # used to work ran its body; sqlglot's signature checks (the parser's builder
@@ -925,6 +1058,9 @@ def analyse_python(path, old_text, hunks, cov, checks=None):
         lo = first_line(stmt)
         hi = header_end(stmt) if l <= header_end(stmt) else stmt.end_lineno
         tests |= cov.tests_covering(path, range(lo, hi + 1))
+    if not module_level and not _same_skeleton(old_tree.body, new_tree.body,
+                                               old_text.split("\n"), new_text.split("\n")):
+        module_level = True  # statements added or removed outside function bodies
     if module_level:
         mc = None
         try:
@@ -965,6 +1101,8 @@ def tests_for_test_file(path, old_text, hunks, cov, tests_by_file, nodeid_num):
         return whole
     if trees_match(old_tree, new_tree, old_text, new_text):
         return set()
+    if not _same_skeleton(old_tree.body, new_tree.body, old_text.split("\n"), new_text.split("\n")):
+        return whole  # a test, helper or setUp added or removed: anything in the file may change
     res = set()
     for l in changed:
         found = False
@@ -1054,7 +1192,7 @@ def file_op_tests(f, cov, tests_by_file, every, readers_of_typing, sqlglotc_test
 NO_TEST_PREFIXES = (".github/", "docs/", "pdoc/", "posts/", "benchmarks/", "sqlglot-integration-tests/")
 NO_TEST_FILES = {"README.md", "CHANGELOG.md", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md", "LICENSE",
                  ".gitignore", ".gitmodules", ".gitpod.yml", ".pre-commit-config.yaml", "sqlglot.png",
-                 "MANIFEST.in", "Makefile"}
+                 "MANIFEST.in", "Makefile", "sqlglot-integration-tests"}  # the last: the submodule pointer
 
 
 def select(text, every, cov, tests_by_file, nodeid_num, reasons, checks=None):

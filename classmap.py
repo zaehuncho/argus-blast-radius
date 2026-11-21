@@ -103,7 +103,15 @@ def _same_callees(a, b):
     def lambdas(n):
         return sorted(_dump(x) for x in ast.walk(n) if isinstance(x, ast.Lambda))
 
+    # a call that mutates what it is called on (`OTHER.pop("K")`) acts outside the value
+    if any(isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr in _MUTATORS
+           for v in (a, b) for x in ast.walk(v)):
+        return False
     return lambdas(a) == lambdas(b) and _callees(a) == _callees(b)
+
+
+_MUTATORS = {"pop", "popitem", "update", "setdefault", "clear", "append", "extend", "insert", "remove",
+             "add", "discard", "sort", "reverse", "__setitem__", "__delitem__", "register", "set"}
 
 
 # Attributes whose edit changes state outside the classes involved:
