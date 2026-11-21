@@ -1106,7 +1106,8 @@ def select(text, every, cov, tests_by_file, nodeid_num, reasons, checks=None):
             reasons.append(f"{path}: data file -> {len(got)}")
         elif path in NO_TEST_FILES or path.startswith(NO_TEST_PREFIXES):
             reasons.append(f"{path}: not read by any test -> 0")
-        elif path.startswith("sqlglotc/") or path == "setup.py":
+        elif path.startswith("sqlglotc/") or path in ("setup.py", "sqlglot/py.typed"):
+            # py.typed is a PEP 561 marker that only packaging reads
             selected |= sqlglotc_tests
             reasons.append(f"{path}: build script -> test_sqlglotc")
         else:
