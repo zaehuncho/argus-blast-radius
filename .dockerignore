@@ -1,0 +1,6 @@
+.git
+output*.jsonl
+map/cov.sqlite
+sample
+tools
+*.md
