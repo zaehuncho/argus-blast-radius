@@ -188,6 +188,38 @@ def same_tree(a, b):
     return ast.dump(a, include_attributes=False) == ast.dump(b, include_attributes=False)
 
 
+class _NoneCompare(ast.NodeTransformer):
+    """Rewrites `x == None` to `x is None` and `x != None` to `x is not None`.
+
+    Every __eq__/__ne__ in sqlglot (Expression, Dialect and its metaclass)
+    returns False against None, as do built-in values, so the two spellings
+    behave the same. Comparing normalized trees treats that swap as no change.
+    """
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        operands = [node.left] + node.comparators
+        ops = []
+        for i, op in enumerate(node.ops):
+            a, b = operands[i], operands[i + 1]
+            none = any(isinstance(x, ast.Constant) and x.value is None for x in (a, b))
+            if none and isinstance(op, ast.Eq):
+                op = ast.Is()
+            elif none and isinstance(op, ast.NotEq):
+                op = ast.IsNot()
+            ops.append(op)
+        node.ops = ops
+        return node
+
+
+def equivalent_tree(a, b):
+    """True when the trees differ only by None-comparison spelling."""
+    import copy
+    na = _NoneCompare().visit(copy.deepcopy(a))
+    nb = _NoneCompare().visit(copy.deepcopy(b))
+    return same_tree(na, nb)
+
+
 def first_line(node):
     return min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
 
@@ -253,6 +285,8 @@ def analyse_python(path, old_text, hunks, cov):
         return None, "patched file does not parse"
     if same_tree(old_tree, new_tree):
         return set(), "no code change"
+    if equivalent_tree(old_tree, new_tree):
+        return set(), "equivalent None comparison"
     tests = set()
     module_level = False
     for l in sorted(changed):
