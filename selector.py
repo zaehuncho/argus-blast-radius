@@ -879,6 +879,10 @@ def main():
             selected = set(every)
             reasons.append(f"{type(e).__name__} {e} -> all")
         plans.append({"cid": cid, "text": text, "selected": selected, "reasons": reasons})
+    drop = {nodeid_num[n] for n in os.environ.get("ARGUS_DROP_TESTS", "").split(",") if n in nodeid_num}
+    if drop:  # PROBE ONLY: measure how much these tests cost on the practice set
+        for p in plans:
+            p["selected"] = p["selected"] - drop
     try:
         confirm_by_running(plans, dur, tfile, tid, nodeid_num, every)
     except Exception as e:  # the static selections stand

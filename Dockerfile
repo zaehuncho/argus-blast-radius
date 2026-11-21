@@ -26,4 +26,6 @@ COPY runner.py /app/runner.py
 RUN python /app/runner.py --prepare /app/sqlglot
 COPY selector.py /app/selector.py
 RUN chmod -R a+rX /app
+# PROBE: drops test_execute_tpcds from every selection to measure its share of the practice score.
+ENV ARGUS_DROP_TESTS=tests/test_executor.py::TestExecutor::test_execute_tpcds
 CMD ["python", "/app/selector.py"]
