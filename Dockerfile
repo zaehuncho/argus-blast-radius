@@ -26,4 +26,6 @@ COPY runner.py /app/runner.py
 RUN python /app/runner.py --prepare /app/sqlglot
 COPY selector.py /app/selector.py
 RUN chmod -R a+rX /app
+# A/B variant: static selection only (no in-container test runs).
+ENV ARGUS_NO_RUNNER=1
 CMD ["python", "/app/selector.py"]
