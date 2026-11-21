@@ -653,7 +653,7 @@ def _tree(rel):
     return _TREES[rel]
 
 
-def _mention_sites(name, defining_path, defining_stmt_lines):
+def _mention_sites(name, defining_path, defining_stmt_lines, removed=False):
     """[(path, first line, last line)] of the statements inside function bodies that
     mention `name` (as a name, attribute or string), and [(path, line)] of the lambdas
     built at import whose bodies mention it; None if any mention is evaluated at import
@@ -672,6 +672,8 @@ def _mention_sites(name, defining_path, defining_stmt_lines):
             elif isinstance(node, ast.Attribute) and node.attr == name:
                 hit = True
             elif isinstance(node, ast.Constant) and isinstance(node.value, str) and word.search(node.value):
+                if in_all and removed:
+                    return False  # a star import of a listed but removed name fails
                 if not in_all:
                     if not in_body or node.value != name:
                         return False  # docstrings and other text: doctests could read it
@@ -681,6 +683,8 @@ def _mention_sites(name, defining_path, defining_stmt_lines):
                     return False  # uses under the other name are not found by this search
                 if in_body:
                     hit = True
+                elif removed:
+                    return False  # a top-level `from m import NAME` of a removed name fails at import
                 # a top-level `from m import NAME` only binds it; its uses are found as names
             if hit:
                 if not in_body:
@@ -719,15 +723,69 @@ def _mention_sites(name, defining_path, defining_stmt_lines):
     return sites, lams
 
 
+def _binds(st):
+    """Names a top-level statement that may be added or removed binds: `NAME = value`
+    (one plain name) or a standard-library import (importing one cannot register
+    anything in sqlglot); None for anything else."""
+    if isinstance(st, (ast.Assign, ast.AnnAssign)):
+        targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+        if len(targets) == 1 and isinstance(targets[0], ast.Name) and st.value is not None:
+            return {targets[0].id}
+        return None
+    if isinstance(st, ast.Import):
+        if all(a.name.split(".")[0] in _STDLIB for a in st.names):
+            return {a.asname or a.name.split(".")[0] for a in st.names}
+        return None
+    if isinstance(st, ast.ImportFrom):
+        if st.level == 0 and st.module and st.module.split(".")[0] in _STDLIB and all(a.name != "*" for a in st.names):
+            return {a.asname or a.name for a in st.names}
+    return None
+
+
 def module_constants(path, old_tree, new_tree, cov):
     """(tests, needs import check, names) for a file whose top-level changes are all
-    `NAME = value` edits the rule above can bound (def bodies are left to line
-    coverage); None otherwise."""
-    if CM is None or len(old_tree.body) != len(new_tree.body):
+    `NAME = value` edits, or added/removed `NAME = value` statements and standard-library
+    imports, that the rule above can bound (def bodies are left to line coverage);
+    None otherwise."""
+    if CM is None:
         return None
+    import difflib
     proven = classmap._Proven(old_tree)
-    names, needs_import, lines = set(), False, {}
-    for a, b in zip(old_tree.body, new_tree.body):
+    names, needs_import, lines, removed = set(), False, {}, set()
+    da, db = [ast.dump(s) for s in old_tree.body], [ast.dump(s) for s in new_tree.body]
+    pairs = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=da, b=db, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "replace" and i2 - i1 == j2 - j1:
+            pairs.extend(zip(old_tree.body[i1:i2], new_tree.body[j1:j2]))
+            continue
+        for st in old_tree.body[i1:i2]:  # removed: later lookups of what it bound change
+            got = _binds(st)
+            if got is None:
+                return None
+            for n in got:
+                if n.startswith("__"):
+                    return None
+                names.add(n)
+                removed.add(n)
+                lines.setdefault(n, set()).update(range(st.lineno, st.end_lineno + 1))
+        for st in new_tree.body[j1:j2]:  # added: it runs at import
+            got = _binds(st)
+            if got is None:
+                return None
+            if isinstance(st, (ast.Assign, ast.AnnAssign)):
+                if not classmap._inert(st.value, proven):
+                    if not classmap._same_callees(st.value, st.value):
+                        return None
+                    needs_import = True
+            else:
+                needs_import = True  # the imported names must exist
+            for n in got:
+                if n.startswith("__"):
+                    return None
+                names.add(n)
+    for a, b in pairs:
         if ast.dump(a) == ast.dump(b):
             continue
         if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)) and type(a) is type(b):
@@ -744,7 +802,7 @@ def module_constants(path, old_tree, new_tree, cov):
                                              or ast.dump(a.annotation) != ast.dump(b.annotation)):
             return None
         name = ta[0].id
-        if name.startswith("__") or name in names:
+        if name.startswith("__"):
             return None
         if not classmap._safe(a.value, b.value, proven):
             if not classmap._same_callees(a.value, b.value):
@@ -756,7 +814,7 @@ def module_constants(path, old_tree, new_tree, cov):
         return None
     tests = set()
     for name in names:
-        found = _mention_sites(name, path, lines[name])
+        found = _mention_sites(name, path, lines.get(name, set()), removed=name in removed)
         if found is None:
             return None
         sites, lams = found
