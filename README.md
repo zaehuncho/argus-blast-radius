@@ -15,7 +15,7 @@ Builders Buildathon 2026, RWX track. Given a patch to [sqlglot](https://github.c
 | A data file under `tests/` | the tests that opened it |
 | A patched file that no longer parses, renames, added or deleted files, anything unknown | every test |
 
-Class-level edits are narrowed with a class-usage map (`classmap.py`): the tests that read the changed attribute or entered the changed lambda.
+Class-level edits are narrowed with a class-usage map (`classmap.py`): the tests that read the changed attribute or entered the changed lambda. A value whose rebuild calls the same functions (only constants or operators differ), or an attribute another one is computed from in the same class body (`SHOW_TRIE = new_trie(... for key in SHOW_PARSERS)`), is narrowed too, once the selector has imported the patched module in the container (anything but a clean import selects every test).
 
 After the static pass, two checks run inside the container when the cost model says they pay for their CPU:
 
