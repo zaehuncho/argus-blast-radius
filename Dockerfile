@@ -17,9 +17,10 @@ tarfile.open(fileobj=io.BytesIO(data)).extractall('/app', filter='data')" \
 
 # Coverage and data-file maps built from the pinned commit (tools/build_coverage.sh, tools/make_map.py).
 # The map ships xz-compressed to keep the repository small; unpack it at build time.
-COPY map/cov.sqlite.xz /app/map/cov.sqlite.xz
-RUN python -c "import lzma; open('/app/map/cov.sqlite','wb').write(lzma.open('/app/map/cov.sqlite.xz').read())" \
- && rm /app/map/cov.sqlite.xz
+COPY map/cov.sqlite.xz map/classes.sqlite.xz /app/map/
+RUN python -c "import lzma; [open(f'/app/map/{n}.sqlite','wb').write(lzma.open(f'/app/map/{n}.sqlite.xz').read()) for n in ('cov', 'classes')]" \
+ && rm /app/map/*.xz
+COPY classmap.py /app/classmap.py
 # Bytecode for sqlglot and its tests, so a confirming run only compiles what a patch changed.
 COPY runner.py /app/runner.py
 RUN python /app/runner.py --prepare /app/sqlglot

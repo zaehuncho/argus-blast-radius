@@ -1,5 +1,6 @@
 *.pyc
 /work/
 __pycache__/
+map/classes.sqlite
 map/cov.sqlite
 output*.jsonl

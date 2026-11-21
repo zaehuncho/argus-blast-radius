@@ -24,8 +24,20 @@ import zlib
 DATA = os.environ.get("ARGUS_DATA", "/data")
 SRC = os.environ.get("ARGUS_SQLGLOT", "/app/sqlglot")
 MAP = os.environ.get("ARGUS_MAP", "/app/map/cov.sqlite")
+CLASSMAP = os.environ.get("ARGUS_CLASSMAP", os.path.join(os.path.dirname(MAP), "classes.sqlite"))
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
+
+# Class-usage map (classmap.py): which tests read each class attribute, entered
+# each lambda, or used each class. Without it, class-level edits stay broad.
+CM = None
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import classmap
+    if os.path.exists(CLASSMAP):
+        CM = classmap.ClassMap(CLASSMAP)
+except Exception as _e:  # selection stays correct, only broader
+    print("classmap unavailable:", repr(_e), file=sys.stderr)
 
 
 def log(*a):
@@ -106,23 +118,27 @@ def apply_hunks(old_text, hunks):
             raise PatchMismatch("overlapping hunks")
         out.extend(old[pos:start])
         o = start
+        run_deleted = False  # the current run of edits removed old lines
         for tag, text in body:
             if tag == " ":
                 if o >= len(old) or old[o].rstrip("\r") != text.rstrip("\r"):
                     raise PatchMismatch(f"context differs at line {o + 1}")
                 out.append(old[o])
                 o += 1
+                run_deleted = False
             elif tag == "-":
                 if o >= len(old) or old[o].rstrip("\r") != text.rstrip("\r"):
                     raise PatchMismatch(f"removed line differs at line {o + 1}")
                 changed.add(o + 1)
                 o += 1
                 edits += 1
+                run_deleted = True
             elif tag == "+":
                 out.append(text)
-                # an insertion sits between old lines o and o+1 (1-based)
-                changed.add(max(o, 1))
-                changed.add(o + 1)
+                if not run_deleted:
+                    # a pure insertion sits between old lines o and o+1 (1-based)
+                    changed.add(max(o, 1))
+                    changed.add(o + 1)
                 edits += 1
         pos = o
     out.extend(old[pos:])
@@ -220,6 +236,48 @@ def equivalent_tree(a, b):
     return same_tree(na, nb)
 
 
+def _text(lines, node):
+    return "\n".join(lines[first_line(node) - 1:node.end_lineno])
+
+
+def _dump(node, norm):
+    if norm:
+        import copy
+        node = _NoneCompare().visit(copy.deepcopy(node))
+    return ast.dump(node, include_attributes=False)
+
+
+def _same_body(xs, ys, la, lb, norm):
+    """Statement lists compare equal. Identical source text means an identical
+    tree, so only statements whose text differs are dumped, recursing into
+    classes and functions so a one-line edit never dumps a whole class."""
+    if len(xs) != len(ys):
+        return False
+    for x, y in zip(xs, ys):
+        if type(x) is not type(y):
+            return False
+        if _text(la, x) == _text(lb, y):
+            continue
+        if isinstance(x, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            bx, by = x.body, y.body
+            try:
+                x.body, y.body = [], []
+                same_header = _dump(x, norm) == _dump(y, norm)
+            finally:
+                x.body, y.body = bx, by
+            if not same_header or not _same_body(bx, by, la, lb, norm):
+                return False
+            continue
+        if _dump(x, norm) != _dump(y, norm):
+            return False
+    return True
+
+
+def trees_match(old_tree, new_tree, old_text, new_text, norm=False):
+    """Fast equivalent of same_tree (norm=False) or equivalent_tree (norm=True)."""
+    return _same_body(old_tree.body, new_tree.body, old_text.split("\n"), new_text.split("\n"), norm)
+
+
 def first_line(node):
     return min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
 
@@ -283,9 +341,9 @@ def analyse_python(path, old_text, hunks, cov):
         new_tree = ast.parse(new_text)
     except SyntaxError:
         return None, "patched file does not parse"
-    if same_tree(old_tree, new_tree):
+    if trees_match(old_tree, new_tree, old_text, new_text):
         return set(), "no code change"
-    if equivalent_tree(old_tree, new_tree):
+    if trees_match(old_tree, new_tree, old_text, new_text, norm=True):
         return set(), "equivalent None comparison"
     tests = set()
     module_level = False
@@ -303,9 +361,11 @@ def analyse_python(path, old_text, hunks, cov):
             continue
         if not in_func:
             lam = lambda_body_at(stmt, l)
-            if lam is not None:
-                # inside a lambda body: runs only when the lambda is called
-                tests |= cov.tests_covering(path, [l])
+            if lam is not None and CM is not None:
+                # inside a lambda body: runs only when the lambda is called. A changed
+                # line may be one that short-circuiting skipped, so take every test
+                # that entered the lambda.
+                tests |= cov.tests_covering(path, [l]) | CM.entered(path, lam.lineno)
             else:
                 module_level = True
             continue
@@ -313,6 +373,14 @@ def analyse_python(path, old_text, hunks, cov):
         hi = header_end(stmt) if l <= header_end(stmt) else stmt.end_lineno
         tests |= cov.tests_covering(path, range(lo, hi + 1))
     if module_level:
+        narrowed = None
+        if CM is not None:
+            try:
+                narrowed = classmap.narrow(CM, cov, path, old_text, new_text, old_tree, new_tree)
+            except Exception as e:  # the broad rule stands
+                log("classmap error", path, repr(e))
+        if narrowed is not None:
+            return tests | narrowed[0], "class map: " + narrowed[1]
         tests |= cov.tests_touching_file(path)
     return tests, "module level" if module_level else "function body"
 
@@ -325,7 +393,7 @@ def tests_for_test_file(path, old_text, hunks, cov, tests_by_file, nodeid_num):
         new_tree = ast.parse(new_text)
     except SyntaxError:
         return whole
-    if same_tree(old_tree, new_tree):
+    if trees_match(old_tree, new_tree, old_text, new_text):
         return set()
     res = set()
     for l in changed:
@@ -430,8 +498,12 @@ def cost_ms(workers, dur):
     return max(sum(dur[t] for t in w) for w in workers) + WORKER_COST_MS * len(workers)
 
 
-# Runner CPU model from runner.py's measurements (fixed s, s per recorded s).
-RUN_MODEL = {"plain": (0.45, 1.0), "optimizer": (1.25, 1.4), "executor": (2.2, 2.0)}
+# Runner CPU model from runner.py's measurements (fixed s, s per recorded s), scaled
+# by 1.5: the scorer's machine used ~22 s of runner CPU on a batch where ours
+# predicted roughly two thirds of that.
+RUN_SCALE = 1.5
+RUN_MODEL = {k: (f * RUN_SCALE, p * RUN_SCALE) for k, (f, p) in
+             {"plain": (0.45, 1.0), "optimizer": (1.25, 1.4), "executor": (2.2, 2.0)}.items()}
 RUN_MARGIN_S = 1.0          # run only if predicted CPU is this much below the static cost
 RUN_BUDGET_PER_COMMIT_S = 2.0
 RUN_TIMEOUT_S = 25.0
