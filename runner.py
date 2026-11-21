@@ -233,7 +233,7 @@ def _apply(old_text, hunks, path):
             # nearest offset where the hunk's old lines all match, as `git apply` does
             found = None
             for d in range(1, len(old) + 1):
-                for at in (start - d, start + d):
+                for at in (start + d, start - d):  # git apply looks forward first on a tie
                     if pos <= at <= len(old) - len(block) and old[at:at + len(block)] == block:
                         found = at
                         break

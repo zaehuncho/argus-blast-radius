@@ -113,7 +113,7 @@ def _locate(old, start, block, lo):
     if start >= lo and fits(start):
         return start
     for d in range(1, len(old) + 1):
-        for at in (start - d, start + d):
+        for at in (start + d, start - d):  # git apply looks forward first on a tie
             if lo <= at <= len(old) - len(block) and fits(at):
                 return at
         if start - d < lo and start + d > len(old) - len(block):
@@ -121,8 +121,9 @@ def _locate(old, start, block, lo):
     raise PatchMismatch(f"context differs at line {start + 1}")
 
 
-def apply_hunks(old_text, hunks):
-    """Applies hunks to old_text. Returns (new_text, changed_old_lines).
+def apply_hunks(old_text, hunks, deleted=None):
+    """Applies hunks to old_text. Returns (new_text, changed_old_lines); `deleted`, if
+    given, receives the old line numbers the patch removes.
 
     Raises PatchMismatch if any context or removed line differs from the file,
     so a misapplied patch can never look like 'no change'.
@@ -153,6 +154,8 @@ def apply_hunks(old_text, hunks):
                 if o >= len(old) or old[o].rstrip("\r") != text.rstrip("\r"):
                     raise PatchMismatch(f"removed line differs at line {o + 1}")
                 changed.add(o + 1)
+                if deleted is not None:
+                    deleted.add(o + 1)
                 o += 1
                 edits += 1
                 run_deleted = True
@@ -415,6 +418,33 @@ def _dump_no_lambda_bodies(node):
         return repr(node)
     return type(node).__name__ + "(" + ",".join(
         f"{k}={_dump_no_lambda_bodies(v)}" for k, v in ast.iter_fields(node)) + ")"
+
+
+_BLOCKS = ("body", "orelse", "finalbody", "handlers", "cases")
+
+
+def _shape(node):
+    """The statement structure of a def or block: which statements sit in which block,
+    expressions aside."""
+    out = [type(node).__name__]
+    for field in _BLOCKS:
+        stmts = getattr(node, field, None)
+        if isinstance(stmts, list) and stmts and isinstance(stmts[0], ast.AST):
+            out.append((field, tuple(_shape(s) for s in stmts)))
+    return tuple(out)
+
+
+def _defs_holding(tree, lines):
+    """Every def (nested ones included) whose body holds one of these old lines."""
+    if not lines:
+        return []
+    found = []
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
+            lo, hi = first_line(n.body[0]), n.end_lineno
+            if any(lo <= l <= hi for l in lines):
+                found.append(n)
+    return found
 
 
 def _lazy_annotations(tree):
@@ -802,8 +832,9 @@ def _mention_sites(name, defining_path, defining_stmt_lines, removed=False):
             elif isinstance(node, ast.Attribute) and node.attr == name:
                 hit = True
             elif isinstance(node, ast.Constant) and isinstance(node.value, str) and (
-                    node.value == name or node.value.endswith("." + name)):
-                # getattr(x, "NAME"), mock.patch("sqlglot.m.NAME"), __all__ entries; other text
+                    node.value == name or ("." in node.value and " " not in node.value
+                                           and name in node.value.split("."))):
+                # getattr(x, "NAME"), mock.patch("sqlglot.m.NAME[.attr]"), __all__ entries; other text
                 # (docstrings, messages) cannot reach the binding: doctests are not collected
                 if in_all:
                     if removed:
@@ -1006,7 +1037,8 @@ def analyse_python(path, old_text, hunks, cov, checks=None):
     """Returns (set of tests, reason). None means 'select everything'. A narrowing that
     holds only if the patched module still imports appends `path` to `checks`
     (without `checks` such a narrowing is not used)."""
-    new_text, changed = apply_hunks(old_text, hunks)
+    deleted = set()
+    new_text, changed = apply_hunks(old_text, hunks, deleted)
     try:
         old_tree = ast.parse(old_text)
     except SyntaxError:
@@ -1061,6 +1093,16 @@ def analyse_python(path, old_text, hunks, cov, checks=None):
     if not module_level and not _same_skeleton(old_tree.body, new_tree.body,
                                                old_text.split("\n"), new_text.split("\n")):
         module_level = True  # statements added or removed outside function bodies
+    # A run that removes lines inside a function can also move code between blocks (a
+    # dedent) or add some next to it (a new else branch); coverage of the edited
+    # statement misses callers that never reached it. When a function holding a removed
+    # line has a different statement structure after the patch, every test that runs
+    # any of its body counts.
+    for d in _defs_holding(old_tree, deleted):
+        qp = _qualpath(old_tree, d)
+        nd = _find_def(new_tree, qp) if qp else None
+        if nd is None or _shape(d) != _shape(nd):
+            tests |= cov.tests_covering(path, range(first_line(d.body[0]), d.end_lineno + 1))
     if module_level:
         mc = None
         try:
