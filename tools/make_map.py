@@ -102,6 +102,21 @@ for key, ps in opens.items():
     for t in targets:
         for p in ps:
             orows.add((t, p))
+# isolated runs: files each test's own process (and its workers) read
+iso_opens = os.path.join(work, "isoopens")
+iso_open_files = 0
+if os.path.isdir(iso_opens):
+    valid = {t["number"] for t in tests}
+    for name in os.listdir(iso_opens):
+        if not name.endswith(".txt") or name == "status.txt":
+            continue
+        n = int(name.split(".", 1)[0])
+        if n not in valid:
+            continue
+        iso_open_files += 1
+        for p in open(os.path.join(iso_opens, name)).read().split():
+            orows.add((n, p))
+print(f"isolated read files={iso_open_files}")
 dst.executemany("insert into opens values (?, ?)", sorted(orows))
 dst.commit()
 dst.execute("vacuum")

@@ -86,29 +86,48 @@ def parse_patch(text):
     return files
 
 
+class PatchMismatch(Exception):
+    """The patch's context or removed lines do not match the pinned file."""
+
+
 def apply_hunks(old_text, hunks):
-    """Applies hunks to old_text. Returns (new_text, changed_old_lines)."""
+    """Applies hunks to old_text. Returns (new_text, changed_old_lines).
+
+    Raises PatchMismatch if any context or removed line differs from the file,
+    so a misapplied patch can never look like 'no change'.
+    """
     old = old_text.split("\n")
     out, changed = [], set()
     pos = 0  # 0-based index into old
+    edits = 0
     for old_start, body in hunks:
         start = max(old_start - 1, 0)
+        if start < pos:
+            raise PatchMismatch("overlapping hunks")
         out.extend(old[pos:start])
         o = start
         for tag, text in body:
             if tag == " ":
-                out.append(old[o] if o < len(old) else text)
+                if o >= len(old) or old[o].rstrip("\r") != text.rstrip("\r"):
+                    raise PatchMismatch(f"context differs at line {o + 1}")
+                out.append(old[o])
                 o += 1
             elif tag == "-":
+                if o >= len(old) or old[o].rstrip("\r") != text.rstrip("\r"):
+                    raise PatchMismatch(f"removed line differs at line {o + 1}")
                 changed.add(o + 1)
                 o += 1
+                edits += 1
             elif tag == "+":
                 out.append(text)
                 # an insertion sits between old lines o and o+1 (1-based)
                 changed.add(max(o, 1))
                 changed.add(o + 1)
+                edits += 1
         pos = o
     out.extend(old[pos:])
+    if not edits:
+        raise PatchMismatch("hunk without edits")
     return "\n".join(out), changed
 
 
@@ -322,6 +341,7 @@ def pack(selected, dur):
 
 def select(text, every, cov, tests_by_file, nodeid_num, reasons):
     selected = set()
+    readers_of_typing = set(tests_by_file.get("tests/test_typing.py", []))
     for f in parse_patch(text):
         path = f["old"] or f["new"]
         if f["old"] is None or f["new"] is None or f["old"] != f["new"]:
@@ -334,6 +354,10 @@ def select(text, every, cov, tests_by_file, nodeid_num, reasons):
             if got is None:
                 reasons.append(f"{path}: {why} -> all")
                 return set(every)
+            if path.startswith("sqlglot/typing/") and why != "no code change":
+                # test_typing reads these files' source and compares annotator
+                # code objects without running them; coverage cannot see that.
+                got = got | readers_of_typing
             selected |= got
             reasons.append(f"{path}: {why} -> {len(got)}")
         elif path.startswith("tests/") and path.endswith(".py"):
@@ -369,9 +393,9 @@ def main():
         try:
             text = open(os.path.join(cdir, name), encoding="utf-8", errors="replace").read()
             selected = select(text, every, cov, tests_by_file, nodeid_num, reasons) & every
-        except Exception as e:  # never crash: a crash rejects the run
+        except Exception as e:  # never crash: a crash rejects the run; a mismatch must not miss
             selected = set(every)
-            reasons.append(f"error {e!r} -> all")
+            reasons.append(f"{type(e).__name__} {e} -> all")
         print(json.dumps({"commit": cid, "workers": pack(selected, dur)}, separators=(",", ":")))
         log(cid, "; ".join(reasons))
 
