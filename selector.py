@@ -212,12 +212,37 @@ class _NoneCompare(ast.NodeTransformer):
     behave the same. Comparing normalized trees treats that swap as no change.
     """
 
-    @staticmethod
-    def _identity_only(x):
+    # Enum members where `==` behaves like `is`. Plain enums compare by identity.
+    # NormalizationStrategy, UsingColumnOrder and AliasPrecedence mix in str, but
+    # every value they are compared with in sqlglot is a member: class defaults are
+    # members and string settings go through the enum constructor. Dialects (str,
+    # equal to dialect classes by name) and TokenType (IntEnum) are left out.
+    _ENUMS = {"ScopeType", "IsPredicatePrecedence", "TrieResult", "ErrorLevel", "DType", "PropertiesLocation",
+              "NormalizationStrategy", "UsingColumnOrder", "AliasPrecedence"}
+    _NESTED_ENUMS = {("DataType", "Type"), ("Properties", "Location")}
+
+    @classmethod
+    def _enum_member(cls, x):
+        if not (isinstance(x, ast.Attribute) and x.attr.isupper()):
+            return False
+        owner = x.value
+        if isinstance(owner, ast.Name):
+            return owner.id in cls._ENUMS
+        if isinstance(owner, ast.Attribute):
+            if owner.attr in cls._ENUMS:
+                return True
+            return isinstance(owner.value, (ast.Attribute, ast.Name)) and (
+                (owner.value.attr if isinstance(owner.value, ast.Attribute) else owner.value.id), owner.attr) in cls._NESTED_ENUMS
+        return False
+
+    @classmethod
+    def _identity_only(cls, x):
         # None, or an expression class (`exp.Foo`): classes compare by identity
         # unless their metaclass defines __eq__, and sqlglot's only one (_Dialect)
         # returns False for anything that is not a dialect or a string.
         if isinstance(x, ast.Constant) and x.value is None:
+            return True
+        if cls._enum_member(x):
             return True
         return (isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "exp"
                 and x.attr[:1].isupper() and not x.attr.isupper()
