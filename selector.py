@@ -895,13 +895,15 @@ def confirm_by_running(plans, dur, tfile, tid, nodeid_num, every):
         if static - est >= RUN_MARGIN_S:
             order.append((static - est, est, p))
     order.sort(key=lambda x: -x[0])
-    # A warm fork server answers like a fresh process (runner.py's checks), but on
-    # the scorer it cost more than it saved (v6.2: 7.0 s CPU against v6.1's 5.3 s
-    # on identical selections), so it is opt-in.
+    # A warm fork server answers like a fresh process (runner.py's checks). Preloading
+    # numpy/pandas/duckdb cost more than it saved on the scorer (v6.2: 7.0 s CPU against
+    # v6.1's 5.3 s on identical selections), so the server preloads pytest only: locally
+    # 0.45 s less CPU on the samples and 2.0 s less on 91 sample-style commits.
     mode = "fresh"
-    if len(order) >= 4 and os.environ.get("ARGUS_FORK"):
+    preload = os.environ.get("ARGUS_FORK_PRELOAD", "")
+    if len(order) >= 4 and not os.environ.get("ARGUS_NO_FORK"):
         try:
-            runner.start_fork_servers()
+            runner.start_fork_servers(preload=preload)
             mode = "fork"
         except Exception as e:
             log("fork server unavailable:", repr(e))
@@ -913,7 +915,7 @@ def confirm_by_running(plans, dur, tfile, tid, nodeid_num, every):
             try:
                 files = runner.files_from_patch(p["text"])
                 res = runner.run_candidates(files, sorted(tid[t] for t in p["selected"]),
-                                            timeout_s=min(RUN_TIMEOUT_S, left), mode=mode)
+                                            timeout_s=min(RUN_TIMEOUT_S, left), mode=mode, preload=preload)
             except Exception as e:
                 p["reasons"].append(f"runner error {type(e).__name__} -> static")
                 continue
