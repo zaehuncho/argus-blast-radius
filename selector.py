@@ -423,29 +423,104 @@ def select(text, every, cov, tests_by_file, nodeid_num, reasons):
     return selected
 
 
+def cost_ms(workers, dur):
+    workers = [w for w in workers if w]
+    if not workers:
+        return 0
+    return max(sum(dur[t] for t in w) for w in workers) + WORKER_COST_MS * len(workers)
+
+
+# Runner CPU model from runner.py's measurements (fixed s, s per recorded s).
+RUN_MODEL = {"plain": (0.45, 1.0), "optimizer": (1.25, 1.4), "executor": (2.2, 2.0)}
+RUN_MARGIN_S = 1.0          # run only if predicted CPU is this much below the static cost
+RUN_BUDGET_PER_COMMIT_S = 2.0
+RUN_TIMEOUT_S = 25.0
+
+
+def runner_kind(selected, tfile):
+    files = {tfile[t] for t in selected}
+    if "tests/test_executor.py" in files:
+        return "executor"
+    if "tests/test_optimizer.py" in files:
+        return "optimizer"
+    return "plain"
+
+
+def confirm_by_running(plans, dur, tfile, tid, nodeid_num, every):
+    """Runs the cheapest-to-confirm candidate sets and keeps only the tests that fail."""
+    if os.environ.get("ARGUS_NO_RUNNER") or not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "runner.py")):
+        return
+    import time
+    try:
+        import runner
+    except Exception as e:
+        log("runner unavailable:", e)
+        return
+    budget = RUN_BUDGET_PER_COMMIT_S * len(plans)
+    start = time.monotonic()
+    order = []
+    for p in plans:
+        sel = p["selected"]
+        if not sel or sel == every:
+            continue
+        static = cost_ms(pack(sel, dur), dur) / 1000
+        fixed, per = RUN_MODEL[runner_kind(sel, tfile)]
+        est = fixed + per * sum(dur[t] for t in sel) / 1000
+        if static - est >= RUN_MARGIN_S:
+            order.append((static - est, est, p))
+    order.sort(key=lambda x: -x[0])
+    for gain, est, p in order:
+        left = budget - (time.monotonic() - start)
+        if left < est * 1.5 + 1:
+            continue
+        try:
+            files = runner.files_from_patch(p["text"])
+            res = runner.run_candidates(files, sorted(tid[t] for t in p["selected"]),
+                                        timeout_s=min(RUN_TIMEOUT_S, left))
+        except Exception as e:
+            p["reasons"].append(f"runner error {type(e).__name__} -> static")
+            continue
+        if res.get("failing") is None:
+            p["reasons"].append(f"runner {res.get('status')} -> static")
+            continue
+        failing = {nodeid_num[n] for n in res["failing"] if n in nodeid_num}
+        p["reasons"].append(f"runner ran {len(p['selected'])} in {res.get('cpu_s', 0):.2f}s cpu -> {len(failing)} fail")
+        p["selected"] = failing
+
+
 def main():
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     dur = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     every = set(dur)
     nodeid_num = {t["id"]: t["number"] for t in tests}
+    tid = {t["number"]: t["id"] for t in tests}
+    tfile = {t["number"]: t["file"] for t in tests}
     tests_by_file = {}
     for t in tests:
         tests_by_file.setdefault(t["file"], []).append(t["number"])
     cov = Map(MAP)
     cdir = os.path.join(DATA, "commits")
+    plans = []
     for name in sorted(os.listdir(cdir)):
         if not name.endswith(".patch"):
             continue
         cid = name[:-len(".patch")]
         reasons = []
+        text = ""
         try:
             text = open(os.path.join(cdir, name), encoding="utf-8", errors="replace").read()
             selected = select(text, every, cov, tests_by_file, nodeid_num, reasons) & every
         except Exception as e:  # never crash: a crash rejects the run; a mismatch must not miss
             selected = set(every)
             reasons.append(f"{type(e).__name__} {e} -> all")
-        print(json.dumps({"commit": cid, "workers": pack(selected, dur)}, separators=(",", ":")))
-        log(cid, "; ".join(reasons))
+        plans.append({"cid": cid, "text": text, "selected": selected, "reasons": reasons})
+    try:
+        confirm_by_running(plans, dur, tfile, tid, nodeid_num, every)
+    except Exception as e:  # the static selections stand
+        log("runner phase failed:", repr(e))
+    for p in plans:
+        print(json.dumps({"commit": p["cid"], "workers": pack(p["selected"] & every, dur)}, separators=(",", ":")))
+        log(p["cid"], "; ".join(p["reasons"]))
 
 
 if __name__ == "__main__":

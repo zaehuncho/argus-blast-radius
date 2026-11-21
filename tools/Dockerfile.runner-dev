@@ -1,0 +1,25 @@
+# Dev image for runner.py (tools/test_runner.py builds and runs it).
+# Same base, packages and sqlglot source as the production image, plus the
+# bytecode that runner.py --prepare compiles at build time.
+# Build from the repository root:
+#   docker build --platform linux/amd64 -f tools/Dockerfile.runner-dev -t argus-runner-dev .
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+
+# The packages the organizers labeled with.
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir --root-user-action=ignore -r /app/requirements.lock
+
+# sqlglot at the pinned commit, fetched exactly as the production Dockerfile does.
+ARG SQLGLOT_COMMIT=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
+RUN python -c "import io, tarfile, urllib.request; \
+data = urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/${SQLGLOT_COMMIT}.tar.gz', timeout=120).read(); \
+tarfile.open(fileobj=io.BytesIO(data)).extractall('/app', filter='data')" \
+ && mv /app/sqlglot-${SQLGLOT_COMMIT} /app/sqlglot
+
+# Bytecode for every sqlglot and test module, and pytest's assertion-rewritten
+# test modules, so a run under the read-only filesystem compiles only what a patch changed.
+COPY runner.py /app/runner.py
+RUN python /app/runner.py --prepare /app/sqlglot && chmod -R a+rX /app
+
+# tools/test_runner.py mounts itself here (.dockerignore keeps tools/ out of the context).
+RUN mkdir -p /app/tools
