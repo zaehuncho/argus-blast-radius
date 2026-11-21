@@ -66,9 +66,34 @@ def pytest_collection_modifyitems(session, config, items):
     if len(keep) != len(items):
         config.hook.pytest_deselected(items=[it for it in items if it.nodeid not in want])
         items[:] = keep
+    _tpcds_only(keep)
     for it in keep:
         _w("I", it.nodeid)
     _w("COLLECTED", len(keep))
+
+
+def _tpcds_only(items):
+    # ARGUS_TPCDS_ONLY="i,j,...": TestExecutor's setUpClass loads only those TPC-DS
+    # fixture pairs (0-based, file order), so test_execute_tpcds parses, executes and
+    # compares just them through its own code path (see tpcds_check.py).
+    only = os.environ.get("ARGUS_TPCDS_ONLY")
+    if only is None:
+        return
+    keep = {int(x) for x in only.split(",") if x.strip()}
+    for it in items:
+        cls, mod = getattr(it, "cls", None), getattr(it, "module", None)
+        if cls is None or cls.__name__ != "TestExecutor" or not hasattr(mod, "load_sql_fixture_pairs"):
+            continue
+        orig = mod.load_sql_fixture_pairs
+        if not getattr(orig, "_argus", False):
+            def narrowed(filename, _orig=orig):
+                pairs = list(_orig(filename))
+                if filename.replace("\\", "/").endswith("tpc-ds/tpc-ds.sql"):
+                    return [p for i, p in enumerate(pairs) if i in keep]
+                return pairs
+            narrowed._argus = True
+            mod.load_sql_fixture_pairs = narrowed
+        break
 
 
 def pytest_runtest_logreport(report):
@@ -92,6 +117,7 @@ BASE_ENV = {
     "PYTEST_ADDOPTS": None,
     "PYTEST_PLUGINS": None,
     "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+    "ARGUS_TPCDS_ONLY": None,  # set per call through extra_env
     # PYTHON_CPU_COUNT is set per run (pool_workers): sqlglot's optimizer and
     # executor tests start ProcessPoolExecutor(spawn) with the default worker
     # count, os.process_cpu_count(), which is the host's, and every worker

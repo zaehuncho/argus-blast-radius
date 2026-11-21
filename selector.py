@@ -212,6 +212,11 @@ TPCDS_PRINTS = os.environ.get("ARGUS_TPCDS_PRINTS", os.path.join(os.path.dirname
 TPCDS_CHECK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpcds_check.py")
 TPCDS_CHECK_CPU_S = 2.6   # measured 2.51 s in the production image
 TPCDS_P_DROP = 0.5        # share of checks expected to come back identical
+# When only a few queries' trees differ, the test narrowed to them (runner.py's
+# ARGUS_TPCDS_ONLY) decides it: every other query provably behaves as before.
+TPCDS_MAX_DIFF = 6
+TPCDS_RUN_FIXED_S, TPCDS_RUN_PAIR_S = 1.6, 1.0   # narrowed run CPU (measured 1.55 s + ~0.8 s a query)
+TPCDS_P_PASS_FEW = 0.75   # validation: 15 of 19 cases with 1-6 differing queries passed
 
 
 class TpcdsBlock:
@@ -927,18 +932,44 @@ def tpcds_checks(plans, dur, runner, budget, start):
         left = budget - (time.monotonic() - start)
         if left < est * 1.5 + 1:
             continue
+        tp = p["tpcds_test"]
         try:
             files = runner.files_from_patch(p["text"])
-            res = runner.run_script(files, [TPCDS_CHECK, "--check", TPCDS_PRINTS], timeout_s=min(20.0, left))
+            res = runner.run_script(files, [TPCDS_CHECK, "--check", TPCDS_PRINTS, str(TPCDS_MAX_DIFF)],
+                                    timeout_s=min(20.0, left))
         except Exception as e:
             p["reasons"].append(f"tpcds check error {type(e).__name__} -> kept")
             continue
-        if res.get("status") == "ok" and res.get("exitcode") == 0:
-            p["selected"] = p["selected"] - {p["tpcds_test"]}
+        ok = res.get("status") == "ok"
+        if ok and res.get("exitcode") == 0:
+            p["selected"] = p["selected"] - {tp}
             p["reasons"].append(f"tpcds check identical in {res['cpu_s']:.2f}s cpu -> dropped")
+            continue
+        m = re.search(r"TPCDS_DIFFER ([0-9,]+)", res.get("log_tail", "")) if ok and res.get("exitcode") == 4 else None
+        p["reasons"].append(f"tpcds check {res.get('status')} exit={res.get('exitcode')} "
+                            f"in {res.get('cpu_s', 0):.2f}s cpu" + (f" ({m.group(1)} differ)" if m else " -> kept"))
+        if not m:
+            continue
+        differ = m.group(1)
+        sel = p["selected"]
+        waste = (cost_ms(pack(sel, dur), dur) - cost_ms(pack(sel - {tp}, dur), dur)) / 1000
+        est2 = RUN_SCALE * (TPCDS_RUN_FIXED_S + TPCDS_RUN_PAIR_S * len(differ.split(",")))
+        left = budget - (time.monotonic() - start)
+        if waste * TPCDS_P_PASS_FEW - est2 < RUN_MARGIN_S or left < est2 * 1.5 + 1:
+            p["reasons"].append("narrowed run not worth it -> kept")
+            continue
+        try:
+            # a slow (possibly hanging) narrowed run times out and keeps the test
+            r2 = runner.run_candidates(files, [TPCDS_ID], timeout_s=min(RUN_TIMEOUT_S, left, 2 * est2 + 2),
+                                       extra_env={"ARGUS_TPCDS_ONLY": differ})
+        except Exception as e:
+            p["reasons"].append(f"narrowed run error {type(e).__name__} -> kept")
+            continue
+        if r2.get("failing") is not None and TPCDS_ID in r2.get("passed", ()):
+            p["selected"] = sel - {tp}
+            p["reasons"].append(f"narrowed run passed in {r2['cpu_s']:.2f}s cpu -> dropped")
         else:
-            p["reasons"].append(f"tpcds check {res.get('status')} exit={res.get('exitcode')} "
-                                f"in {res.get('cpu_s', 0):.2f}s cpu -> kept")
+            p["reasons"].append(f"narrowed run {r2.get('status')} in {r2.get('cpu_s', 0):.2f}s cpu -> kept")
 
 
 def _use_result(p, res, nodeid_num):

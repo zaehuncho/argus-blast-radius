@@ -16,7 +16,8 @@ code, so the test passes if every pair's optimized tree, table set and pickling 
 out as on the pinned commit.
 
   python tpcds_check.py --build OUT.json   fingerprints at the pinned commit (Docker build)
-  python tpcds_check.py --check MAP.json   exit 0: identical; 3: something differs
+  python tpcds_check.py --check MAP.json [K]   exit 0: identical; 4: 1..K pairs differ
+                                           (printed as "TPCDS_DIFFER i,j"); 3: more differ
   python tpcds_check.py --dump DIR         pickles each optimized tree (map building)
 Run with the (patched) sqlglot checkout as the working directory and on sys.path.
 """
@@ -92,9 +93,9 @@ class Differs(Exception):
     pass
 
 
-def compute(dump_dir=None, want=None):
-    """Fingerprints every executed pair; with want, raises Differs at the first pair
-    that does not match it."""
+def compute(dump_dir=None, want=None, max_diff=0, differ=None):
+    """Fingerprints every executed pair. With want, collects the pairs that do not
+    match it in `differ` and raises Differs once more than max_diff of them do."""
     from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs
     from sqlglot import find_tables, parse_one
     from sqlglot.expressions.core import Expr
@@ -114,7 +115,9 @@ def compute(dump_dir=None, want=None):
         optimized = optimize(expression, ensure_schema(schema, dialect=None), leave_tables_isolated=True, dialect=None)
         got[str(i)] = [fingerprint(optimized, Expr), tables]
         if want is not None and want.get(str(i)) != got[str(i)]:
-            raise Differs(i)
+            differ.append(i)
+            if len(differ) > max_diff:
+                raise Differs(i)
         if dump_dir:
             with open(os.path.join(dump_dir, f"{i}.pickle"), "wb") as fh:
                 pickle.dump({"optimized": optimized, "tables": tables}, fh)
@@ -136,11 +139,17 @@ def main(argv):
         return 0
     with open(argv[2], encoding="utf-8") as fh:
         want = json.load(fh)["pairs"]
+    max_diff = int(argv[3]) if len(argv) > 3 else 0
+    differ = []
     try:
-        compute(want=want)
+        compute(want=want, max_diff=max_diff, differ=differ)
     except Differs as e:
-        print(f"tpcds_check: pair {e} differs", file=sys.stderr)
+        print(f"tpcds_check: pair {e} differs, {len(differ)} so far", file=sys.stderr)
         return 3
+    if differ:
+        # only these pairs can behave differently: test_execute_tpcds narrowed to them decides
+        print("TPCDS_DIFFER " + ",".join(map(str, differ)), flush=True)
+        return 4
     return 0
 
 
