@@ -765,6 +765,7 @@ def module_constants(path, old_tree, new_tree, cov):
     import difflib
     proven = classmap._Proven(old_tree)
     names, needs_import, lines, removed = set(), False, {}, set()
+    body = []  # old-line body ranges of same-name defs whose header changed
 
     def lazy(tree):
         return any(isinstance(s, ast.ImportFrom) and s.module == "__future__"
@@ -814,10 +815,17 @@ def module_constants(path, old_tree, new_tree, cov):
         if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)) and type(a) is type(b):
             if classmap._def_header(a) == classmap._def_header(b):
                 continue  # body edits: line coverage
-            # a new header (renamed, new parameters or defaults): every caller of either name
             ga, gb = _binds(a, proven, lazy_old), _binds(b, proven, lazy_new)
             if ga is None or gb is None:
                 return None
+            if a.name == b.name:
+                # same name, new parameters or defaults: the function object is still found
+                # wherever it was (tables built at import included), and every call that
+                # used to work ran its body; sqlglot's signature checks (the parser's builder
+                # fallback, the optimizer's getfullargspec) sit right before the call
+                body.append((first_line(a.body[0]), a.end_lineno))
+                continue
+            # renamed: every caller of either name
             for n in ga | gb:
                 if n.startswith("__"):
                     return None
@@ -844,9 +852,11 @@ def module_constants(path, old_tree, new_tree, cov):
             needs_import = True
         names.add(name)
         lines.setdefault(name, set()).update(range(a.lineno, a.end_lineno + 1))
-    if not names:
+    if not names and not body:
         return None
     tests = set()
+    for lo, hi in body:
+        tests |= cov.tests_covering(path, range(lo, hi + 1))
     for name in names:
         found = _mention_sites(name, path, lines.get(name, set()), removed=name in removed)
         if found is None:
