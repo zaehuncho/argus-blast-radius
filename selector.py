@@ -487,8 +487,9 @@ def analyse_python(path, old_text, hunks, cov):
             # signature, decorators, defaults or bases: evaluated at definition time
             if l < stmt.lineno and descriptor_swap_only(stmt, new_tree, old_tree):
                 # a decorator line: classmethod/staticmethod/property changes only
-                # matter where the function is called or the property read
-                tests |= cov.tests_covering(path, range(first_line(stmt), stmt.end_lineno + 1))
+                # matter where the function is called or the property read, which
+                # runs its body (the def and decorator lines run at class creation)
+                tests |= cov.tests_covering(path, range(first_line(stmt.body[0]), stmt.end_lineno + 1))
                 continue
             if in_func:
                 tests |= cov.tests_covering(path, range(first_line(stmt), stmt.end_lineno + 1))
