@@ -247,16 +247,26 @@ def _dump(node, norm):
     return ast.dump(node, include_attributes=False)
 
 
+def _is_docstring(node):
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+
 def _same_body(xs, ys, la, lb, norm):
     """Statement lists compare equal. Identical source text means an identical
     tree, so only statements whose text differs are dumped, recursing into
-    classes and functions so a one-line edit never dumps a whole class."""
+    classes and functions so a one-line edit never dumps a whole class.
+
+    With norm, docstring text is ignored too: nothing in sqlglot reads __doc__
+    contents (core.py only defaults a missing one to ""), and the doctest
+    module is not collected by pytest."""
     if len(xs) != len(ys):
         return False
-    for x, y in zip(xs, ys):
+    for i, (x, y) in enumerate(zip(xs, ys)):
         if type(x) is not type(y):
             return False
         if _text(la, x) == _text(lb, y):
+            continue
+        if norm and i == 0 and _is_docstring(x) and _is_docstring(y):
             continue
         if isinstance(x, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             bx, by = x.body, y.body
@@ -276,6 +286,125 @@ def _same_body(xs, ys, la, lb, norm):
 def trees_match(old_tree, new_tree, old_text, new_text, norm=False):
     """Fast equivalent of same_tree (norm=False) or equivalent_tree (norm=True)."""
     return _same_body(old_tree.body, new_tree.body, old_text.split("\n"), new_text.split("\n"), norm)
+
+
+# Standard-library modules whose import has no visible side effect.
+_STDLIB = set(getattr(sys, "stdlib_module_names", ())) - {
+    "__future__", "this", "antigravity", "turtle", "turtledemo", "idlelib", "tkinter", "webbrowser"}
+
+
+def _stdlib_import(node):
+    if isinstance(node, ast.Import):
+        return all(a.name.split(".")[0] in _STDLIB for a in node.names)
+    if isinstance(node, ast.ImportFrom):
+        return (node.level == 0 and bool(node.module) and node.module.split(".")[0] in _STDLIB
+                and not any(a.name == "*" for a in node.names))
+    return False
+
+
+def _bound(node):
+    return {a.asname or a.name.split(".")[0] for a in node.names}
+
+
+def _names(tree):
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            out.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(n.name)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)) and not _stdlib_import(n):
+            out |= _bound(n)
+        elif isinstance(n, ast.arg):
+            out.add(n.arg)
+    return out
+
+
+def stdlib_imports_only(old_tree, new_tree, old_text, new_text):
+    """True when the modules differ only in top-level standard-library imports
+    that are reordered without crossing other statements, added under names the
+    old module never used, or removed under names the new module never uses."""
+    def split(tree):
+        imports, rest, slot = [], [], 0
+        for n in tree.body:
+            if _stdlib_import(n):
+                imports.append((slot, ast.dump(n, include_attributes=False), n))
+            else:
+                rest.append(n)
+                slot += 1
+        return imports, rest
+    oi, orest = split(old_tree)
+    ni, nrest = split(new_tree)
+    if not oi and not ni:
+        return False
+    if not _same_body(orest, nrest, old_text.split("\n"), new_text.split("\n"), False):
+        return False
+    old_set = {(s, d) for s, d, _ in oi}
+    new_set = {(s, d) for s, d, _ in ni}
+    old_dumps = {d for _, d, _ in oi}
+    new_dumps = {d for _, d, _ in ni}
+    old_names, new_names = _names(old_tree), _names(new_tree)
+    for s, d, n in ni:
+        if (s, d) in old_set:
+            continue
+        if d in old_dumps:
+            return False  # an existing import moved past other statements
+        if _bound(n) & old_names:
+            return False  # a new import that binds a name the module already used
+    for s, d, n in oi:
+        if d not in new_dumps and _bound(n) & new_names:
+            return False  # a removed import whose name is still used
+    return True
+
+
+_DESCRIPTORS = {"classmethod", "staticmethod", "property"}
+
+
+def _qualpath(tree, target):
+    """Names of the classes/functions enclosing target, outermost first."""
+    def walk(node, path):
+        for child in ast.iter_child_nodes(node):
+            if child is target:
+                return path + [child.name]
+            if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                got = walk(child, path + [child.name])
+                if got:
+                    return got
+        return None
+    return walk(tree, [])
+
+
+def _find_def(tree, path):
+    node = tree
+    for name in path:
+        nxt = [c for c in getattr(node, "body", []) if isinstance(c, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and c.name == name]
+        if len(nxt) != 1:
+            return None
+        node = nxt[0]
+    return node
+
+
+def descriptor_swap_only(old_def, new_tree, old_tree):
+    """The def differs only by adding, removing or swapping classmethod,
+    staticmethod or property decorators. Such a change takes effect only when
+    the function is called or the property read, which runs its body."""
+    if not isinstance(old_def, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    path = _qualpath(old_tree, old_def)
+    new_def = _find_def(new_tree, path) if path else None
+    if new_def is None or type(new_def) is not type(old_def):
+        return False
+
+    def plain(d):
+        return [x for x in d.decorator_list if not (isinstance(x, ast.Name) and x.id in _DESCRIPTORS)]
+    if [ast.dump(x) for x in plain(old_def)] != [ast.dump(x) for x in plain(new_def)]:
+        return False
+    ob, nb = old_def.decorator_list, new_def.decorator_list
+    try:
+        old_def.decorator_list, new_def.decorator_list = [], []
+        return ast.dump(old_def, include_attributes=False) == ast.dump(new_def, include_attributes=False)
+    finally:
+        old_def.decorator_list, new_def.decorator_list = ob, nb
 
 
 def first_line(node):
@@ -344,7 +473,9 @@ def analyse_python(path, old_text, hunks, cov):
     if trees_match(old_tree, new_tree, old_text, new_text):
         return set(), "no code change"
     if trees_match(old_tree, new_tree, old_text, new_text, norm=True):
-        return set(), "equivalent None comparison"
+        return set(), "equivalent (None comparison / docstring)"
+    if stdlib_imports_only(old_tree, new_tree, old_text, new_text):
+        return set(), "standard-library imports only"
     tests = set()
     module_level = False
     for l in sorted(changed):
@@ -354,6 +485,11 @@ def analyse_python(path, old_text, hunks, cov):
             continue
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and l <= header_end(stmt):
             # signature, decorators, defaults or bases: evaluated at definition time
+            if l < stmt.lineno and descriptor_swap_only(stmt, new_tree, old_tree):
+                # a decorator line: classmethod/staticmethod/property changes only
+                # matter where the function is called or the property read
+                tests |= cov.tests_covering(path, range(first_line(stmt), stmt.end_lineno + 1))
+                continue
             if in_func:
                 tests |= cov.tests_covering(path, range(first_line(stmt), stmt.end_lineno + 1))
             else:
@@ -441,6 +577,44 @@ def pack(selected, dur):
     return best[1]
 
 
+def file_op_tests(f, cov, tests_by_file, every, readers_of_typing, sqlglotc_tests):
+    """Tests for an added, deleted or renamed file; None means select everything."""
+    old, new = f["old"], f["new"]
+    res = set()
+    for p, gone in ((old, True), (new, False)):
+        if p is None or (p == old and p == new):
+            continue
+        if p in NO_TEST_FILES or p.startswith(NO_TEST_PREFIXES):
+            continue
+        if p.startswith("tests/") and not p.endswith(".py"):
+            # data files: whoever read it (gone) or lists its directory (both)
+            res |= cov.tests_opening(p)
+            continue
+        if p.startswith("sqlglot/") and p.endswith(".py"):
+            if gone:
+                # every test whose process loaded the module now fails to import it
+                res |= cov.tests_touching_file(p) or set(every)
+            # sqlglotc's build lists package files; test_typing scans sqlglot/typing
+            res |= sqlglotc_tests
+            if p.startswith("sqlglot/typing/"):
+                res |= readers_of_typing
+            continue
+        if p.startswith("tests/") and p.endswith(".py"):
+            if not gone:
+                return None  # a new test module could do anything at collection
+            res |= set(tests_by_file.get(p, [])) | cov.tests_touching_file(p)
+            continue
+        if p.startswith("sqlglotc/") or p == "setup.py":
+            res |= sqlglotc_tests
+            continue
+        return None
+    # added Python modules are reached only through an edit elsewhere in the patch,
+    # which its own file's rule covers; renamed/modified content is handled above
+    if old and new and old != new and f["hunks"] and new.endswith(".py"):
+        return None
+    return res
+
+
 # Repository files no test reads (checked: only tests/test_sqlglotc.py reads
 # anything outside sqlglot/ and tests/, namely sqlglotc/ and the build config).
 NO_TEST_PREFIXES = (".github/", "docs/", "pdoc/", "posts/", "benchmarks/", "sqlglot-integration-tests/")
@@ -456,9 +630,25 @@ def select(text, every, cov, tests_by_file, nodeid_num, reasons):
     for f in parse_patch(text):
         path = f["old"] or f["new"]
         if f["old"] is None or f["new"] is None or f["old"] != f["new"]:
-            reasons.append(f"{path}: added/removed/renamed -> all")
-            return set(every)
+            got = file_op_tests(f, cov, tests_by_file, every, readers_of_typing, sqlglotc_tests)
+            if got is None:
+                reasons.append(f"{path}: added/removed/renamed -> all")
+                return set(every)
+            selected |= got
+            reasons.append(f"{f['old']} -> {f['new']}: file op -> {len(got)}")
+            continue
         full = os.path.join(SRC, path)
+        if path in ("setup.cfg", "pyproject.toml", "tox.ini", "pytest.ini"):
+            old_text = open(full, encoding="utf-8").read() if os.path.exists(full) else ""
+            new_text, _ = apply_hunks(old_text, f["hunks"])
+            if "pytest" in old_text.lower() or "pytest" in new_text.lower() or path in ("tox.ini", "pytest.ini"):
+                reasons.append(f"{path}: may configure pytest -> all")
+                return set(every)
+            # mypy/build settings only; setuptools_scm in test_sqlglotc reads pyproject.toml
+            got = sqlglotc_tests if path == "pyproject.toml" else set()
+            selected |= got
+            reasons.append(f"{path}: no pytest settings -> {len(got)}")
+            continue
         if path.startswith("sqlglot/") and path.endswith(".py"):
             old_text = open(full, encoding="utf-8").read()
             got, why = analyse_python(path, old_text, f["hunks"], cov)
